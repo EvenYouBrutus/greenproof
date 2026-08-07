@@ -1,0 +1,12 @@
+.env
+node_modules/
+target/
+dist/
+circuits/build/
+circuits/circomlib/
+circuits/environmental_compliance.r1cs
+circuits/environmental_compliance.sym
+circuits/environmental_compliance_js/
+frontend/public/circuit/
+*.log
+scripts/test/tmp/
