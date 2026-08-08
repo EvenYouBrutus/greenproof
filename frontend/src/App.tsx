@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { MapContainer, TileLayer, Marker, Popup } from "react-leaflet";
-import { generateProof, type RegionConfig } from "./lib/zk";
+import { generateProof, verifyProofLocally, type RegionConfig } from "./lib/zk";
 import "./app.css";
 
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || "http://localhost:8080";
@@ -11,6 +11,8 @@ const DEFAULT_ALLOWED_LAND_COVER_CODE = 40;
 interface EvidenceState {
   ok: boolean;
   evidence?: any;
+  evidence_session?: string;
+  evidence_hash?: string;
   error?: string;
   note?: string;
 }
@@ -71,8 +73,8 @@ export default function App() {
 
         <footer>
           <strong>Prototype limitation:</strong> GreenProof is not an official EUDR compliance or
-          certification system. Current environmental evidence uses live OpenStreetMap/Nominatim/Overpass
-          data; OSM land-cover tags are a proxy, not satellite deforestation detection.
+          certification system. Land cover comes from ESA WorldCover 2021 v200 satellite-derived data;
+          it is not historical satellite deforestation detection.
         </footer>
       </div>
     </div>
@@ -128,7 +130,7 @@ function SupplierView({ onVerificationCreated }: { onVerificationCreated: (id: s
   }
 
   async function generateZkProof() {
-    if (!evidenceState?.ok || !evidenceState.evidence) return;
+    if (!evidenceState?.ok || !evidenceState.evidence || !evidenceState.evidence_session || !evidenceState.evidence_hash) return;
     if (!supplierId || !supplierSecret) {
       setProveError("Enter a supplier identifier and secret. They are used only for the local proof witness.");
       return;
@@ -155,6 +157,7 @@ function SupplierView({ onVerificationCreated }: { onVerificationCreated: (id: s
         allowedLandCoverCode: DEFAULT_ALLOWED_LAND_COVER_CODE,
         evidenceProtectedFlag: ev.protected_area.status,
         evidenceLandCoverCode: ev.land_cover.code,
+        evidenceHash: evidenceState.evidence_hash,
       });
       setProofResult(result);
     } catch (e: any) {
@@ -168,7 +171,7 @@ function SupplierView({ onVerificationCreated }: { onVerificationCreated: (id: s
   }
 
   async function createVerification() {
-    if (!proofResult || !evidenceState?.evidence) return;
+    if (!proofResult || !evidenceState?.evidence_session) return;
     setSharing(true);
     setShareError(null);
     try {
@@ -178,10 +181,7 @@ function SupplierView({ onVerificationCreated }: { onVerificationCreated: (id: s
         body: JSON.stringify({
           proof: proofResult.proof,
           public_signals: proofResult.publicSignals,
-          evidence: {
-            protected_area: evidenceState.evidence.protected_area,
-            land_cover: evidenceState.evidence.land_cover,
-          },
+          evidence_session: evidenceState.evidence_session,
         }),
       });
       const data = await resp.json();
@@ -337,8 +337,8 @@ function SupplierView({ onVerificationCreated }: { onVerificationCreated: (id: s
           <div className="share-box">
             <h4>Create a shareable verification</h4>
             <p>
-              Only the proof, public signals and evidence provenance are stored in memory.
-              Private witness values are not stored.
+              The backend-issued evidence commitment binds this proof to its environmental lookup.
+              Only the proof, public signals and sanitized provenance are stored in memory.
             </p>
             <button disabled={sharing} onClick={createVerification} className="primary">
               {sharing ? "Verifying proof…" : "VERIFY & CREATE SHARE LINK"}
@@ -380,6 +380,8 @@ function EvidencePanel({ evidence }: { evidence: any }) {
         <div><span>Classification</span><strong>{evidence.land_cover.classification}</strong><small>Code {evidence.land_cover.code}</small></div>
       </div>
       <p className="source-note">{evidence.land_cover.note}</p>
+      <p className="source-note">Raw provider response fingerprint: <code>{evidence.land_cover.raw_response_sha256}</code></p>
+      {evidence.evidence_hash && <p className="source-note">Evidence commitment: <code>{evidence.evidence_hash}</code></p>}
     </div>
   );
 }
@@ -423,14 +425,8 @@ function AuditorView({ initialId }: { initialId: string | null }) {
     try {
       const proof = JSON.parse(proofText);
       const publicSignals = JSON.parse(publicText);
-      const resp = await fetch(`${BACKEND_URL}/api/verify-proof`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ proof, public_signals: publicSignals }),
-      });
-      const data = await resp.json();
-      if (!resp.ok) throw new Error(data.error || "Verification failed.");
-      setResult({ ...data, public_signals: publicSignals });
+      const zk_proof_valid = await verifyProofLocally(proof, publicSignals);
+      setResult({ zk_proof_valid, public_signals: publicSignals });
     } catch (e: any) {
       setError("Could not parse or verify the submitted proof: " + (e?.message || String(e)));
     } finally {
@@ -565,6 +561,7 @@ function AuditorEvidence({ evidence }: { evidence: any }) {
         <div><span>Land-cover result</span><strong>{evidence.land_cover.classification}</strong><small>Code {evidence.land_cover.code}</small></div>
       </div>
       <p className="source-note">{evidence.land_cover.note}</p>
+      <p className="source-note">Evidence commitment: <code>{evidence.evidence_hash}</code></p>
     </div>
   );
 }

@@ -4,7 +4,7 @@
 
 GreenProof is a hackathon prototype for cocoa supply chains. It demonstrates how a supplier can prove that a private set of facts satisfies public environmental constraints using a real Groth16 zero-knowledge proof, while an auditor receives only the verification result and public evidence provenance.
 
-> **Prototype limitation:** GreenProof is not an official EUDR compliance or certification system. It does not independently establish legal compliance or deforestation-free status. Current environmental evidence uses live OpenStreetMap/Nominatim/Overpass data, and OSM land-cover tags are a proxy rather than satellite deforestation detection.
+> **Prototype limitation:** GreenProof is not an official EUDR compliance or certification system. It does not independently establish legal compliance or deforestation-free status. Land cover is obtained from ESA WorldCover 2021 v200; this is a satellite-derived land-cover observation, not historical deforestation detection.
 
 ## The problem
 
@@ -99,15 +99,14 @@ The exact coordinate is currently sent temporarily to the backend because the MV
 | Source | Current role |
 |---|---|
 | Nominatim / OpenStreetMap | Reverse geocoding and place metadata |
-| Overpass API / OpenStreetMap | Protected-area tags and `natural=*` land-cover proxy |
-| Protected Planet / WDPA | Documented production-grade integration point; not wired into the MVP |
-| Copernicus Land Monitoring Service | Documented satellite/land-cover integration point; not wired into the MVP |
+| Overpass API / OpenStreetMap | Protected-area tag proxy |
+| ESA WorldCover 2021 v200 | Primary satellite-derived 10 m land-cover class, based on Sentinel-1/Sentinel-2 |
 
 The app does not fabricate evidence when a live source fails. It returns an explicit error instead.
 
 ### Important limitation
 
-The current OSM `natural=*` classification is **not** satellite deforestation detection. Do not describe the MVP as proving "deforestation-free" in the legal EUDR sense.
+ESA WorldCover classifies land cover for 2021; it is **not** a historical deforestation analysis. Do not describe the MVP as proving "deforestation-free" in the legal EUDR sense.
 
 A production version should replace/supplement this preprocessing step with authoritative environmental datasets, signed evidence attestations, and historical satellite analysis.
 
@@ -199,7 +198,7 @@ Tampering with the proof or public signals makes verification fail.
 
 ### 2. Evidence consistency
 
-The circuit binds the private environmental witness to a public Poseidon evidence hash.
+The backend normalizes the ESA WorldCover class and protected-area result, computes a Poseidon evidence hash over encoded coordinates and that compact claim, and issues a short-lived one-time evidence session. It accepts a proof only when the proof's public evidence hash and fixed public policy signals match that backend-issued session.
 
 ### 3. Environmental truth
 

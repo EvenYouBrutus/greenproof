@@ -11,25 +11,30 @@
 //!     https://nominatim.org/release-docs/latest/api/Reverse/
 //!     Usage policy requires a descriptive User-Agent and rate limiting
 //!     (max ~1 req/s for the public instance): https://operations.osmfoundation.org/policies/nominatim/
-//!   - Overpass API (OpenStreetMap) - protected-area / land-cover proxy tags.
+//!   - Overpass API (OpenStreetMap) - protected-area proxy tags.
 //!     https://wiki.openstreetmap.org/wiki/Overpass_API
 //!     Tags used: boundary=protected_area, leisure=nature_reserve,
-//!     natural=* (used as a free, no-credential land-cover proxy).
+//!   - ESA WorldCover 2021 v200 - satellite-derived, 10 m global land-cover
+//!     classification from Copernicus Sentinel-1 and Sentinel-2 data. The
+//!     public Terrascope WMS endpoint is queried server-side for a point
+//!     feature value. This is the land-cover source used by the proof flow.
 //!
 //! NOT integrated in this MVP (documented as future work, see README):
 //!   - Copernicus Land Monitoring Service tree-cover density: requires a
 //!     registered Copernicus Data Space Ecosystem (CDSE) account/API
 //!     credentials. Wiring point is left in `.env.example`
-//!     (COPERNICUS_CLIENT_ID / COPERNICUS_CLIENT_SECRET) but no fallback
-//!     fake data is substituted when those are absent - land-cover
-//!     classification instead uses the real (but coarser) OSM `natural=`/
-//!     `landuse=` tagging as an honestly-documented proxy.
+//!     (COPERNICUS_CLIENT_ID / COPERNICUS_CLIENT_SECRET). No fallback data is
+//!     substituted when ESA WorldCover is unavailable: the lookup fails
+//!     explicitly rather than emitting a fabricated environmental claim.
 
 use crate::time::now_iso;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const NOMINATIM_BASE: &str = "https://nominatim.openstreetmap.org";
 const OVERPASS_BASE: &str = "https://overpass-api.de/api/interpreter";
+const WORLDCOVER_WMS_DEFAULT: &str = "https://titiler.terrascope.be/wms";
+const WORLDCOVER_LAYER: &str = "WORLDCOVER_2021_MAP";
 const USER_AGENT: &str = "GreenProof-MVP/0.1 (hackathon prototype; contact: set-your-contact-here)";
 
 #[derive(Debug, thiserror::Error)]
@@ -42,6 +47,10 @@ pub enum GeoError {
     NominatimUnavailable(String),
     #[error("Overpass API request failed: {0}")]
     OverpassUnavailable(String),
+    #[error("ESA WorldCover request failed: {0}")]
+    WorldCoverUnavailable(String),
+    #[error("ESA WorldCover returned an unsupported land-cover response")]
+    WorldCoverUnparseable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +73,7 @@ pub struct LandCoverEvidence {
     pub source_url: String,
     pub retrieved_at: String,
     pub note: &'static str,
+    pub raw_response_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +86,167 @@ pub struct LocationEvidence {
     pub reverse_geocode_source_url: String,
     pub protected_area: ProtectedAreaEvidence,
     pub land_cover: LandCoverEvidence,
+}
+
+/// Raw provider output is kept server-side. It is intentionally not made a
+/// circuit input and is not returned in verification records.
+#[derive(Debug, Clone)]
+struct RawLandCoverResponse {
+    body: String,
+    source_url: String,
+}
+
+/// The compact, deterministic claim that crosses the provider/ZK boundary.
+#[derive(Debug, Clone)]
+struct NormalizedLandCoverClaim {
+    source_class: i64,
+    code: i64,
+    classification: &'static str,
+}
+
+/// One provider abstraction: additional providers can implement the same
+/// raw-response -> normalized-claim boundary without changing the ZK flow.
+struct EsaWorldCoverProvider {
+    base_url: String,
+}
+
+impl EsaWorldCoverProvider {
+    fn from_environment() -> Self {
+        Self {
+            base_url: std::env::var("GREENPROOF_WORLDCOVER_WMS_URL")
+                .unwrap_or_else(|_| WORLDCOVER_WMS_DEFAULT.to_string()),
+        }
+    }
+
+    async fn fetch_raw(
+        &self,
+        client: &reqwest::Client,
+        lat: f64,
+        lon: f64,
+    ) -> Result<RawLandCoverResponse, GeoError> {
+        // WMS 1.1.1 keeps EPSG:4326 BBOX axis order unambiguous: minLon,
+        // minLat, maxLon, maxLat. A tiny deterministic bbox identifies the
+        // pixel containing the requested point.
+        let epsilon = 0.00005_f64;
+        let url = reqwest::Url::parse_with_params(
+            &self.base_url,
+            [
+                ("SERVICE", "WMS".to_string()),
+                ("VERSION", "1.1.1".to_string()),
+                ("REQUEST", "GetFeatureInfo".to_string()),
+                ("LAYERS", WORLDCOVER_LAYER.to_string()),
+                ("QUERY_LAYERS", WORLDCOVER_LAYER.to_string()),
+                ("SRS", "EPSG:4326".to_string()),
+                (
+                    "BBOX",
+                    format!(
+                        "{},{},{},{}",
+                        lon - epsilon,
+                        lat - epsilon,
+                        lon + epsilon,
+                        lat + epsilon
+                    ),
+                ),
+                ("WIDTH", "1".to_string()),
+                ("HEIGHT", "1".to_string()),
+                ("X", "0".to_string()),
+                ("Y", "0".to_string()),
+                ("INFO_FORMAT", "application/json".to_string()),
+                ("FORMAT", "image/png".to_string()),
+            ],
+        )
+        .map_err(|e| GeoError::WorldCoverUnavailable(e.to_string()))?;
+        let response = client
+            .get(url.clone())
+            .header("User-Agent", USER_AGENT)
+            .send()
+            .await
+            .map_err(|e| GeoError::WorldCoverUnavailable(e.to_string()))?;
+        if !response.status().is_success() {
+            return Err(GeoError::WorldCoverUnavailable(format!(
+                "HTTP {}",
+                response.status()
+            )));
+        }
+        let body = response
+            .text()
+            .await
+            .map_err(|e| GeoError::WorldCoverUnavailable(e.to_string()))?;
+        Ok(RawLandCoverResponse {
+            body,
+            source_url: url.to_string(),
+        })
+    }
+
+    fn normalize(raw: &RawLandCoverResponse) -> Result<NormalizedLandCoverClaim, GeoError> {
+        let value = serde_json::from_str::<serde_json::Value>(&raw.body)
+            .ok()
+            .and_then(|json| find_numeric_class(&json))
+            .or_else(|| raw.body.trim().parse::<i64>().ok())
+            .ok_or(GeoError::WorldCoverUnparseable)?;
+
+        // ESA WorldCover v200 classes. Preserve the existing circuit's
+        // allowed agricultural code (40) while making its provenance
+        // satellite-derived rather than an OSM tag proxy.
+        let (code, classification) = match value {
+            10 => (10, "tree cover"),
+            20 => (20, "shrubland"),
+            30 => (30, "grassland"),
+            40 => (40, "cropland"),
+            50 => (50, "built-up"),
+            60 => (60, "bare / sparse vegetation"),
+            70 => (70, "snow and ice"),
+            80 => (80, "permanent water bodies"),
+            90 => (90, "herbaceous wetland"),
+            95 => (95, "mangroves"),
+            100 => (100, "moss and lichen"),
+            _ => (0, "unclassified"),
+        };
+        Ok(NormalizedLandCoverClaim {
+            source_class: value,
+            code,
+            classification,
+        })
+    }
+}
+
+fn find_numeric_class(value: &serde_json::Value) -> Option<i64> {
+    match value {
+        serde_json::Value::Number(n) => n.as_i64(),
+        serde_json::Value::String(s) => s.parse().ok(),
+        serde_json::Value::Array(values) => values.iter().find_map(find_numeric_class),
+        serde_json::Value::Object(map) => ["value", "class", "gray", "band1", "pixelValue"]
+            .iter()
+            .find_map(|key| map.get(*key).and_then(find_numeric_class))
+            .or_else(|| map.values().find_map(find_numeric_class)),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod provider_tests {
+    use super::*;
+
+    #[test]
+    fn worldcover_class_is_normalized_deterministically() {
+        let raw = RawLandCoverResponse {
+            body: r#"{"features":[{"properties":{"value":40}}]}"#.to_string(),
+            source_url: "https://example.invalid/wms".to_string(),
+        };
+        let claim = EsaWorldCoverProvider::normalize(&raw).unwrap();
+        assert_eq!(claim.source_class, 40);
+        assert_eq!(claim.code, 40);
+        assert_eq!(claim.classification, "cropland");
+    }
+
+    #[test]
+    fn unknown_worldcover_class_is_not_allowed_cropland() {
+        let raw = RawLandCoverResponse {
+            body: r#"{"value":255}"#.to_string(),
+            source_url: "https://example.invalid/wms".to_string(),
+        };
+        assert_eq!(EsaWorldCoverProvider::normalize(&raw).unwrap().code, 0);
+    }
 }
 
 fn validate(lat: f64, lon: f64) -> Result<(), GeoError> {
@@ -129,7 +300,7 @@ async fn reverse_geocode(
     Ok((country, display_name))
 }
 
-/// Real Overpass query for protected-area and natural/land-cover tags within
+/// Real Overpass query for protected-area tags within
 /// `radius_m` metres of the point.
 async fn overpass_query(
     client: &reqwest::Client,
@@ -144,8 +315,6 @@ async fn overpass_query(
   relation(around:{radius},{lat},{lon})["boundary"="protected_area"];
   way(around:{radius},{lat},{lon})["leisure"="nature_reserve"];
   relation(around:{radius},{lat},{lon})["leisure"="nature_reserve"];
-  way(around:{radius},{lat},{lon})["natural"];
-  relation(around:{radius},{lat},{lon})["natural"];
 );
 out tags center {radius_small};"#,
         radius = radius_m,
@@ -174,27 +343,6 @@ out tags center {radius_small};"#,
         .map_err(|e| GeoError::OverpassUnavailable(e.to_string()))
 }
 
-/// Maps an OSM `natural=`/`landuse=` tag value to a coarse land-cover code.
-/// This mapping is a documented, honest proxy for a real land-cover
-/// classification scheme (a stand-in for Copernicus tree-cover density
-/// classes, which require registered API credentials not wired up in this
-/// MVP - see module docs above). It is NOT a fabricated compliance decision;
-/// it is a deterministic function of real tag data returned by Overpass.
-fn land_cover_code_for_tag(tag_value: &str) -> (i64, &'static str) {
-    match tag_value {
-        "wood" | "forest" => (10, "forest"),
-        "scrub" | "heath" => (20, "shrubland"),
-        "grassland" | "meadow" | "farmland" => (40, "agricultural / grassland"),
-        "wetland" => (30, "wetland"),
-        "water" => (50, "water"),
-        "bare_rock" | "sand" | "beach" => (60, "bare / sparse"),
-        other => {
-            let _ = other;
-            (0, "unclassified")
-        }
-    }
-}
-
 /// Runs the full real evidence lookup for a coordinate. Every field in the
 /// result is derived from a live HTTP response, never invented.
 pub async fn check_location(
@@ -207,6 +355,9 @@ pub async fn check_location(
 
     let (country, display_name) = reverse_geocode(client, lat, lon).await?;
     let overpass = overpass_query(client, lat, lon, protected_radius_m).await?;
+    let provider = EsaWorldCoverProvider::from_environment();
+    let raw_land_cover = provider.fetch_raw(client, lat, lon).await?;
+    let land_claim = EsaWorldCoverProvider::normalize(&raw_land_cover)?;
 
     let elements = overpass
         .get("elements")
@@ -215,7 +366,6 @@ pub async fn check_location(
         .unwrap_or_default();
 
     let mut matched_protected = Vec::new();
-    let mut land_cover_tag: Option<String> = None;
 
     for el in &elements {
         let tags = el.get("tags").cloned().unwrap_or_default();
@@ -230,19 +380,10 @@ pub async fn check_location(
                 .to_string();
             matched_protected.push(name);
         }
-
-        if land_cover_tag.is_none() {
-            if let Some(nat) = tags.get("natural").and_then(|v| v.as_str()) {
-                land_cover_tag = Some(nat.to_string());
-            }
-        }
     }
 
     let protected_status = !matched_protected.is_empty();
-    let (code, classification_label) = match &land_cover_tag {
-        Some(tag) => land_cover_code_for_tag(tag),
-        None => (0, "unclassified (no OSM natural= tag found nearby)"),
-    };
+    let raw_response_sha256 = format!("{:x}", Sha256::digest(raw_land_cover.body.as_bytes()));
 
     let evidence = LocationEvidence {
         latitude: lat,
@@ -261,15 +402,15 @@ pub async fn check_location(
             retrieved_at: now_iso(),
         },
         land_cover: LandCoverEvidence {
-            classification: classification_label.to_string(),
-            code,
-            source: "OpenStreetMap via Overpass API",
-            dataset: "natural=* tag (proxy classification)",
-            source_url: "https://overpass-api.de".to_string(),
+            classification: land_claim.classification.to_string(),
+            code: land_claim.code,
+            source: "ESA WorldCover",
+            dataset: "ESA WorldCover 2021 land-cover map (10 m, Sentinel-1/Sentinel-2)",
+            source_url: raw_land_cover.source_url,
             retrieved_at: now_iso(),
-            note: "Proxy for Copernicus Land Monitoring Service tree-cover density; \
-                   Copernicus CDSE integration requires API credentials not configured \
-                   in this MVP (see .env.example) and is listed as future work.",
+            note: "Satellite-derived class from ESA WorldCover 2021 v200. This is a land-cover \
+                   observation, not a historical deforestation or legal-compliance determination.",
+            raw_response_sha256,
         },
     };
 

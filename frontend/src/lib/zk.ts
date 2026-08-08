@@ -34,6 +34,10 @@ export interface ProveParams {
   allowedLandCoverCode: number;
   evidenceProtectedFlag: boolean;
   evidenceLandCoverCode: number;
+  // Calculated by the backend from its own environmental lookup. Passing this
+  // through preserves the existing Poseidon/Circom relation while preventing
+  // the client from inventing a replacement commitment at verification time.
+  evidenceHash: string;
 }
 
 export interface ProveResult {
@@ -58,7 +62,10 @@ export async function generateProof(params: ProveParams): Promise<ProveResult> {
 
   const protectedFlag = params.evidenceProtectedFlag ? 1n : 0n;
   const landCoverCode = BigInt(params.evidenceLandCoverCode);
-  const evidenceHash = poseidon4([latEnc, lonEnc, protectedFlag, landCoverCode]);
+  const locallyComputedEvidenceHash = poseidon4([latEnc, lonEnc, protectedFlag, landCoverCode]);
+  if (locallyComputedEvidenceHash.toString() !== params.evidenceHash) {
+    throw new Error("Environmental evidence commitment does not match the private coordinate and normalized claim. Run the lookup again.");
+  }
 
   const preflightFailures: string[] = [];
   if (!(latEnc >= latMin && latEnc <= latMax)) preflightFailures.push("LOCATION OUTSIDE SUPPORTED REGION (latitude)");
@@ -82,7 +89,7 @@ export async function generateProof(params: ProveParams): Promise<ProveResult> {
     quantityThreshold: params.quantityThresholdKg.toString(),
     allowedLandCoverCode: params.allowedLandCoverCode.toString(),
     supplierCommitment: supplierCommitment.toString(),
-    evidenceHash: evidenceHash.toString(),
+    evidenceHash: params.evidenceHash,
   };
 
   // If pre-flight already failed, we still attempt the real proof so the

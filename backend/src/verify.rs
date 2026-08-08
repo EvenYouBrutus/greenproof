@@ -62,7 +62,11 @@ pub async fn verify_proof(
     let proof_path = tmp_dir.join("proof.json");
     let public_path = tmp_dir.join("public.json");
     tokio::fs::write(&proof_path, serde_json::to_vec_pretty(&req.proof)?).await?;
-    tokio::fs::write(&public_path, serde_json::to_vec_pretty(&req.public_signals)?).await?;
+    tokio::fs::write(
+        &public_path,
+        serde_json::to_vec_pretty(&req.public_signals)?,
+    )
+    .await?;
 
     let output = Command::new("node")
         .arg(format!("{}/verify.js", scripts_dir))
@@ -82,8 +86,8 @@ pub async fn verify_proof(
         return Err(VerifyError::NoOutput);
     }
 
-    let zk_proof_valid = output.status.success() && stdout.contains("VALID")
-        && !stdout.contains("INVALID");
+    let zk_proof_valid =
+        output.status.success() && stdout.contains("VALID") && !stdout.contains("INVALID");
 
     Ok(VerifyResult {
         zk_proof_valid,

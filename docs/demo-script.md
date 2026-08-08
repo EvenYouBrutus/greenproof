@@ -120,4 +120,4 @@ Say:
 
 Say:
 
-> GreenProof turns environmental compliance from data disclosure into verifiable proof. The current prototype uses OpenStreetMap evidence; the production roadmap replaces that proxy with authenticated satellite and protected-area datasets.
+> GreenProof turns environmental compliance from data disclosure into verifiable proof. The current prototype uses ESA WorldCover satellite-derived land-cover evidence and an OpenStreetMap protected-area proxy; the production roadmap adds authenticated historical analysis and authoritative protected-area data.

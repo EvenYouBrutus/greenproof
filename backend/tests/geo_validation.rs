@@ -14,13 +14,17 @@
 // public check_location entrypoint's synchronous validation short-circuit,
 // which returns before any network I/O for out-of-range inputs.
 
+#[path = "../src/time.rs"]
+mod time;
 #[path = "../src/geo.rs"]
 mod geo;
 
 #[tokio::test]
 async fn invalid_latitude_is_rejected_without_network_call() {
     let client = reqwest::Client::new();
-    let err = geo::check_location(&client, 120.0, 0.0, 1000).await.unwrap_err();
+    let err = geo::check_location(&client, 120.0, 0.0, 1000)
+        .await
+        .unwrap_err();
     match err {
         geo::GeoError::InvalidLatitude(v) => assert_eq!(v, 120.0),
         other => panic!("expected InvalidLatitude, got {other:?}"),
@@ -30,7 +34,9 @@ async fn invalid_latitude_is_rejected_without_network_call() {
 #[tokio::test]
 async fn invalid_longitude_is_rejected_without_network_call() {
     let client = reqwest::Client::new();
-    let err = geo::check_location(&client, 0.0, 220.0, 1000).await.unwrap_err();
+    let err = geo::check_location(&client, 0.0, 220.0, 1000)
+        .await
+        .unwrap_err();
     match err {
         geo::GeoError::InvalidLongitude(v) => assert_eq!(v, 220.0),
         other => panic!("expected InvalidLongitude, got {other:?}"),
