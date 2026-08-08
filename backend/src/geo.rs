@@ -34,7 +34,7 @@ use sha2::{Digest, Sha256};
 const NOMINATIM_BASE: &str = "https://nominatim.openstreetmap.org";
 const OVERPASS_BASE: &str = "https://overpass-api.de/api/interpreter";
 const WORLDCOVER_WMS_DEFAULT: &str = "https://titiler.terrascope.be/wms";
-const WORLDCOVER_LAYER: &str = "WORLDCOVER_2021_MAP";
+const WORLDCOVER_LAYER: &str = "esa-worldcover-map-10m-2021-v2_map";
 const USER_AGENT: &str = "GreenProof-MVP/0.1 (hackathon prototype; contact: set-your-contact-here)";
 /// Fixed Overpass search radius for protected-area detection.
 ///
@@ -133,34 +133,36 @@ impl EsaWorldCoverProvider {
         lat: f64,
         lon: f64,
     ) -> Result<RawLandCoverResponse, GeoError> {
-        // WMS 1.1.1 keeps EPSG:4326 BBOX axis order unambiguous: minLon,
-        // minLat, maxLon, maxLat. A tiny deterministic bbox identifies the
-        // pixel containing the requested point.
+        // WMS 1.3.0 EPSG:4326 BBOX axis order is latitude,longitude (the
+        // reverse of WMS 1.1.1's lon,lat). A tiny deterministic bbox
+        // identifies the pixel containing the requested point.
         let epsilon = 0.00005_f64;
         let url = reqwest::Url::parse_with_params(
             &self.base_url,
             [
                 ("SERVICE", "WMS".to_string()),
-                ("VERSION", "1.1.1".to_string()),
+                ("VERSION", "1.3.0".to_string()),
                 ("REQUEST", "GetFeatureInfo".to_string()),
                 ("LAYERS", WORLDCOVER_LAYER.to_string()),
                 ("QUERY_LAYERS", WORLDCOVER_LAYER.to_string()),
-                ("SRS", "EPSG:4326".to_string()),
+                ("STYLES", "".to_string()),
+                ("CRS", "EPSG:4326".to_string()),
                 (
                     "BBOX",
                     format!(
                         "{},{},{},{}",
-                        lon - epsilon,
                         lat - epsilon,
-                        lon + epsilon,
-                        lat + epsilon
+                        lon - epsilon,
+                        lat + epsilon,
+                        lon + epsilon
                     ),
                 ),
                 ("WIDTH", "1".to_string()),
                 ("HEIGHT", "1".to_string()),
-                ("X", "0".to_string()),
-                ("Y", "0".to_string()),
-                ("INFO_FORMAT", "application/json".to_string()),
+                ("I", "0".to_string()),
+                ("J", "0".to_string()),
+                ("TIME", "2021-01-01".to_string()),
+                ("INFO_FORMAT", "application/geo+json".to_string()),
                 ("FORMAT", "image/png".to_string()),
             ],
         )
@@ -224,7 +226,7 @@ fn find_numeric_class(value: &serde_json::Value) -> Option<i64> {
         serde_json::Value::Number(n) => n.as_i64(),
         serde_json::Value::String(s) => s.parse().ok(),
         serde_json::Value::Array(values) => values.iter().find_map(find_numeric_class),
-        serde_json::Value::Object(map) => ["value", "class", "gray", "band1", "pixelValue"]
+        serde_json::Value::Object(map) => ["band_1", "value", "class", "gray", "band1", "pixelValue"]
             .iter()
             .find_map(|key| map.get(*key).and_then(find_numeric_class))
             .or_else(|| map.values().find_map(find_numeric_class)),
