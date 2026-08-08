@@ -32,11 +32,10 @@ struct AppState {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CheckLocationRequest {
     latitude: f64,
     longitude: f64,
-    #[serde(default = "default_radius")]
-    protected_radius_m: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,22 +92,11 @@ struct VerifyProofRequest {
     evidence_session: String,
 }
 
-fn default_radius() -> u32 {
-    1000
-}
-
 async fn check_location(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CheckLocationRequest>,
 ) -> impl IntoResponse {
-    match geo::check_location(
-        &state.http_client,
-        req.latitude,
-        req.longitude,
-        req.protected_radius_m,
-    )
-    .await
-    {
+    match geo::check_location(&state.http_client, req.latitude, req.longitude).await {
         Ok(evidence) => match create_evidence_session(&state, &evidence).await {
             Ok((session_id, evidence_hash)) => (
                 StatusCode::OK,
@@ -393,6 +381,34 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 fn create_verification_id() -> String {
     random_id("GP")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protected_radius_cannot_be_supplied_by_client() {
+        let rejected = serde_json::from_str::<CheckLocationRequest>(
+            r#"{"latitude": 6.6666, "longitude": -1.6163, "protected_radius_m": 0}"#,
+        );
+        assert!(
+            rejected.is_err(),
+            "client-supplied protected_radius_m must be rejected"
+        );
+
+        let accepted = serde_json::from_str::<CheckLocationRequest>(
+            r#"{"latitude": 6.6666, "longitude": -1.6163}"#,
+        )
+        .expect("latitude/longitude-only body must deserialize");
+        assert!((accepted.latitude - 6.6666).abs() < f64::EPSILON);
+        assert!((accepted.longitude - -1.6163).abs() < f64::EPSILON);
+
+        // Policy radius is server-fixed and non-zero so a zero-radius bypass
+        // cannot be reintroduced via request fields.
+        assert_eq!(geo::PROTECTED_RADIUS_M, 1000);
+        assert!(geo::PROTECTED_RADIUS_M > 0);
+    }
 }
 
 #[tokio::main]

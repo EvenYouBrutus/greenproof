@@ -36,6 +36,15 @@ const OVERPASS_BASE: &str = "https://overpass-api.de/api/interpreter";
 const WORLDCOVER_WMS_DEFAULT: &str = "https://titiler.terrascope.be/wms";
 const WORLDCOVER_LAYER: &str = "WORLDCOVER_2021_MAP";
 const USER_AGENT: &str = "GreenProof-MVP/0.1 (hackathon prototype; contact: set-your-contact-here)";
+/// Fixed Overpass search radius for protected-area detection.
+///
+/// This must not be client-controlled: a caller who could shrink the radius
+/// (e.g. to 0) would weaken or disable the protected-area check while still
+/// receiving a backend-issued evidence session and hash for `protectedFlag = 0`.
+pub const PROTECTED_RADIUS_M: u32 = 1000;
+
+// Fail closed at compile time if the policy radius is ever set to zero.
+const _: () = assert!(PROTECTED_RADIUS_M > 0);
 
 #[derive(Debug, thiserror::Error)]
 pub enum GeoError {
@@ -301,12 +310,11 @@ async fn reverse_geocode(
 }
 
 /// Real Overpass query for protected-area tags within
-/// `radius_m` metres of the point.
+/// [`PROTECTED_RADIUS_M`] metres of the point.
 async fn overpass_query(
     client: &reqwest::Client,
     lat: f64,
     lon: f64,
-    radius_m: u32,
 ) -> Result<serde_json::Value, GeoError> {
     let query = format!(
         r#"[out:json][timeout:25];
@@ -317,7 +325,7 @@ async fn overpass_query(
   relation(around:{radius},{lat},{lon})["leisure"="nature_reserve"];
 );
 out tags center {radius_small};"#,
-        radius = radius_m,
+        radius = PROTECTED_RADIUS_M,
         lat = lat,
         lon = lon,
         radius_small = 50
@@ -349,12 +357,11 @@ pub async fn check_location(
     client: &reqwest::Client,
     lat: f64,
     lon: f64,
-    protected_radius_m: u32,
 ) -> Result<LocationEvidence, GeoError> {
     validate(lat, lon)?;
 
     let (country, display_name) = reverse_geocode(client, lat, lon).await?;
-    let overpass = overpass_query(client, lat, lon, protected_radius_m).await?;
+    let overpass = overpass_query(client, lat, lon).await?;
     let provider = EsaWorldCoverProvider::from_environment();
     let raw_land_cover = provider.fetch_raw(client, lat, lon).await?;
     let land_claim = EsaWorldCoverProvider::normalize(&raw_land_cover)?;
@@ -397,7 +404,7 @@ pub async fn check_location(
             matched_features: matched_protected,
             source: "OpenStreetMap via Overpass API",
             dataset: "boundary=protected_area / leisure=nature_reserve tags",
-            query_radius_m: protected_radius_m,
+            query_radius_m: PROTECTED_RADIUS_M,
             source_url: "https://overpass-api.de".to_string(),
             retrieved_at: now_iso(),
         },
