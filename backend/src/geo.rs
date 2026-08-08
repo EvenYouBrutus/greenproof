@@ -190,15 +190,48 @@ impl EsaWorldCoverProvider {
     }
 
     fn normalize(raw: &RawLandCoverResponse) -> Result<NormalizedLandCoverClaim, GeoError> {
-        let value = serde_json::from_str::<serde_json::Value>(&raw.body)
-            .ok()
-            .and_then(|json| find_numeric_class(&json))
+        let json = serde_json::from_str::<serde_json::Value>(&raw.body)
+            .map_err(|_| GeoError::WorldCoverUnparseable)?;
+
+        // `esa-worldcover-map-10m-2021-v2_map` is Terrascope's *rendered*
+        // visualization layer: GetFeatureInfo on it returns the pixel's
+        // displayed color (band_1=Red, band_2=Green, band_3=Blue from
+        // ESA's published legend palette), not the underlying discrete
+        // class code. Treating band_1 alone as the class (as if it were a
+        // raw single-band classification raster) is wrong: e.g. a
+        // Built-up pixel renders as legend color FA0000, so band_1=250 is
+        // just the Red channel of "built-up", not class "250" (which
+        // doesn't exist - ESA WorldCover only defines 10-100). The real
+        // class must be recovered by matching the rendered RGB triplet
+        // against the legend (https://esa-worldcover.org).
+        if let Some((r, g, b)) = find_rgb_triplet(&json) {
+            let (code, classification) = ESA_WORLDCOVER_LEGEND
+                .iter()
+                .find(|(lr, lg, lb, ..)| (*lr, *lg, *lb) == (r, g, b))
+                .map(|&(_, _, _, code, classification)| (code, classification))
+                .ok_or(GeoError::WorldCoverUnparseable)?;
+            return Ok(NormalizedLandCoverClaim {
+                source_class: code,
+                code,
+                classification,
+            });
+        }
+
+        // Fallback for providers/tests that return the discrete class
+        // code directly rather than a rendered color triplet.
+        let value = find_numeric_class(&json)
             .or_else(|| raw.body.trim().parse::<i64>().ok())
             .ok_or(GeoError::WorldCoverUnparseable)?;
 
-        // ESA WorldCover v200 classes. Preserve the existing circuit's
-        // allowed agricultural code (40) while making its provenance
-        // satellite-derived rather than an OSM tag proxy.
+        // Only these eleven values are real ESA WorldCover v200 classes.
+        // Any other raw value (e.g. a nodata/edge artifact) is not a
+        // land-cover observation we can honestly report. Per this
+        // module's contract (see file header), an unusable source result
+        // must produce an explicit `GeoError`, never a guessed/hardcoded
+        // classification - silently faking one would feed an unverifiable
+        // code into the evidence hash and ZK circuit, surfacing later as
+        // an opaque proof-assertion failure instead of a clear
+        // evidence-lookup error here.
         let (code, classification) = match value {
             10 => (10, "tree cover"),
             20 => (20, "shrubland"),
@@ -211,7 +244,7 @@ impl EsaWorldCoverProvider {
             90 => (90, "herbaceous wetland"),
             95 => (95, "mangroves"),
             100 => (100, "moss and lichen"),
-            _ => (0, "unclassified"),
+            _ => return Err(GeoError::WorldCoverUnparseable),
         };
         Ok(NormalizedLandCoverClaim {
             source_class: value,
@@ -221,12 +254,50 @@ impl EsaWorldCoverProvider {
     }
 }
 
+/// ESA WorldCover v200 published legend: (Red, Green, Blue, class code,
+/// classification). Source: https://esa-worldcover.org (official palette,
+/// e.g. Cropland F096FF, Built-up FA0000).
+const ESA_WORLDCOVER_LEGEND: &[(u8, u8, u8, i64, &str)] = &[
+    (0, 100, 0, 10, "tree cover"),
+    (255, 187, 34, 20, "shrubland"),
+    (255, 255, 76, 30, "grassland"),
+    (240, 150, 255, 40, "cropland"),
+    (250, 0, 0, 50, "built-up"),
+    (180, 180, 180, 60, "bare / sparse vegetation"),
+    (240, 240, 240, 70, "snow and ice"),
+    (0, 100, 200, 80, "permanent water bodies"),
+    (0, 150, 160, 90, "herbaceous wetland"),
+    (0, 207, 117, 95, "mangroves"),
+    (250, 230, 160, 100, "moss and lichen"),
+];
+
+/// Extracts a rendered-pixel RGB triplet from a GetFeatureInfo response
+/// that carries it as separate `band_1`/`band_2`/`band_3` properties (the
+/// shape returned by Terrascope's `_map` visualization layer).
+fn find_rgb_triplet(value: &serde_json::Value) -> Option<(u8, u8, u8)> {
+    match value {
+        serde_json::Value::Object(map) => {
+            let band = |key: &str| -> Option<u8> {
+                map.get(key)
+                    .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                    .and_then(|n| u8::try_from(n).ok())
+            };
+            match (band("band_1"), band("band_2"), band("band_3")) {
+                (Some(r), Some(g), Some(b)) => Some((r, g, b)),
+                _ => map.values().find_map(find_rgb_triplet),
+            }
+        }
+        serde_json::Value::Array(values) => values.iter().find_map(find_rgb_triplet),
+        _ => None,
+    }
+}
+
 fn find_numeric_class(value: &serde_json::Value) -> Option<i64> {
     match value {
         serde_json::Value::Number(n) => n.as_i64(),
         serde_json::Value::String(s) => s.parse().ok(),
         serde_json::Value::Array(values) => values.iter().find_map(find_numeric_class),
-        serde_json::Value::Object(map) => ["band_1", "value", "class", "gray", "band1", "pixelValue"]
+        serde_json::Value::Object(map) => ["value", "class", "gray", "band1", "pixelValue"]
             .iter()
             .find_map(|key| map.get(*key).and_then(find_numeric_class))
             .or_else(|| map.values().find_map(find_numeric_class)),
@@ -251,12 +322,59 @@ mod provider_tests {
     }
 
     #[test]
-    fn unknown_worldcover_class_is_not_allowed_cropland() {
+    fn unrecognized_worldcover_class_is_rejected_not_faked() {
         let raw = RawLandCoverResponse {
             body: r#"{"value":255}"#.to_string(),
             source_url: "https://example.invalid/wms".to_string(),
         };
-        assert_eq!(EsaWorldCoverProvider::normalize(&raw).unwrap().code, 0);
+        assert!(matches!(
+            EsaWorldCoverProvider::normalize(&raw),
+            Err(GeoError::WorldCoverUnparseable)
+        ));
+    }
+
+    #[test]
+    fn rendered_map_layer_rgb_is_resolved_via_legend_not_band_1_alone() {
+        // Regression test: this is the actual response shape from the
+        // live `esa-worldcover-map-10m-2021-v2_map` layer. band_1=250 is
+        // just the Red channel of ESA's "built-up" legend color
+        // (FA0000 = 250,0,0) - it must resolve to class 50 via the
+        // legend, not be treated as (or rejected as) a raw class "250".
+        let raw = RawLandCoverResponse {
+            body: r#"{"properties":{"band_1":250,"band_2":0,"band_3":0,"dimension":{"time":"2021-01-01"}}}"#
+                .to_string(),
+            source_url: "https://example.invalid/wms".to_string(),
+        };
+        let claim = EsaWorldCoverProvider::normalize(&raw).unwrap();
+        assert_eq!(claim.code, 50);
+        assert_eq!(claim.classification, "built-up");
+    }
+
+    #[test]
+    fn rendered_map_layer_cropland_color_resolves_to_code_40() {
+        // Cropland's legend color is F096FF = (240, 150, 255).
+        let raw = RawLandCoverResponse {
+            body: r#"{"properties":{"band_1":240,"band_2":150,"band_3":255}}"#.to_string(),
+            source_url: "https://example.invalid/wms".to_string(),
+        };
+        let claim = EsaWorldCoverProvider::normalize(&raw).unwrap();
+        assert_eq!(claim.code, 40);
+        assert_eq!(claim.classification, "cropland");
+    }
+
+    #[test]
+    fn unrecognized_rgb_triplet_is_rejected_not_faked() {
+        // A color that doesn't match any of the eleven legend entries
+        // (e.g. an anti-aliased edge pixel) must not be silently mapped
+        // to a guessed class.
+        let raw = RawLandCoverResponse {
+            body: r#"{"properties":{"band_1":123,"band_2":45,"band_3":67}}"#.to_string(),
+            source_url: "https://example.invalid/wms".to_string(),
+        };
+        assert!(matches!(
+            EsaWorldCoverProvider::normalize(&raw),
+            Err(GeoError::WorldCoverUnparseable)
+        ));
     }
 }
 
