@@ -38,3 +38,10 @@ async fn invalid_longitude_is_rejected_without_network_call() {
         other => panic!("expected InvalidLongitude, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn test_real_coordinate_overpass() {
+    let client = reqwest::Client::new();
+    let result = geo::overpass_query(&client, 6.6666, -1.6163).await;
+    assert!(result.is_ok(), "overpass_query failed: {:?}", result.err());
+}

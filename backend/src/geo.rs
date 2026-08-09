@@ -32,7 +32,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const NOMINATIM_BASE: &str = "https://nominatim.openstreetmap.org";
-const OVERPASS_BASE: &str = "https://overpass-api.de/api/interpreter";
 const WORLDCOVER_WMS_DEFAULT: &str = "https://titiler.terrascope.be/wms";
 const WORLDCOVER_LAYER: &str = "esa-worldcover-map-10m-2021-v2_map";
 const USER_AGENT: &str = "GreenProof-MVP/0.1 (hackathon prototype; contact: set-your-contact-here)";
@@ -170,6 +169,7 @@ impl EsaWorldCoverProvider {
         let response = client
             .get(url.clone())
             .header("User-Agent", USER_AGENT)
+            .timeout(std::time::Duration::from_secs(15))
             .send()
             .await
             .map_err(|e| GeoError::WorldCoverUnavailable(e.to_string()))?;
@@ -401,6 +401,7 @@ async fn reverse_geocode(
     let resp = client
         .get(&url)
         .header("User-Agent", USER_AGENT)
+        .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
         .map_err(|e| GeoError::NominatimUnavailable(e.to_string()))?;
@@ -429,9 +430,15 @@ async fn reverse_geocode(
     Ok((country, display_name))
 }
 
+const OVERPASS_ENDPOINTS: &[&str] = &[
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.openstreetmap.fr/api/interpreter",
+];
+
 /// Real Overpass query for protected-area tags within
 /// [`PROTECTED_RADIUS_M`] metres of the point.
-async fn overpass_query(
+pub(crate) async fn overpass_query(
     client: &reqwest::Client,
     lat: f64,
     lon: f64,
@@ -451,24 +458,37 @@ out tags center {radius_small};"#,
         radius_small = 50
     );
 
-    let resp = client
-        .post(OVERPASS_BASE)
-        .header("User-Agent", USER_AGENT)
-        .form(&[("data", query)])
-        .send()
-        .await
-        .map_err(|e| GeoError::OverpassUnavailable(e.to_string()))?;
+    let mut last_error = String::new();
 
-    if !resp.status().is_success() {
-        return Err(GeoError::OverpassUnavailable(format!(
-            "HTTP {}",
-            resp.status()
-        )));
+    for endpoint in OVERPASS_ENDPOINTS {
+        let req = client
+            .post(*endpoint)
+            .header("User-Agent", USER_AGENT)
+            .timeout(std::time::Duration::from_secs(10))
+            .form(&[("data", &query)]);
+
+        match req.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(val) => return Ok(val),
+                    Err(e) => {
+                        last_error = format!("JSON parse error on {}: {}", endpoint, e);
+                    }
+                }
+            }
+            Ok(resp) => {
+                last_error = format!("HTTP {} from {}", resp.status(), endpoint);
+            }
+            Err(e) => {
+                last_error = format!("Request failed to {}: {}", endpoint, e);
+            }
+        }
     }
 
-    resp.json::<serde_json::Value>()
-        .await
-        .map_err(|e| GeoError::OverpassUnavailable(e.to_string()))
+    Err(GeoError::OverpassUnavailable(format!(
+        "All Overpass endpoints failed. Last error: {}",
+        last_error
+    )))
 }
 
 /// Runs the full real evidence lookup for a coordinate. Every field in the
