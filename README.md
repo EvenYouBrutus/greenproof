@@ -2,17 +2,17 @@
 
 **Privacy-preserving environmental verification for commodity supply chains.**
 
-GreenProof is a hackathon prototype that lets a supplier prove an environmental policy about a private site without revealing the exact coordinates to the verifier.
+GreenProof lets a supplier prove an environmental policy about a private site without revealing the exact coordinates to the final verifier.
 
-## What changed
+## Forest-loss verification
 
 The environmental flow now includes a real historical forest-loss predicate:
 
-> **No detected Hansen/UMD forest loss occurred in the queried site after the selected cutoff year.**
+> **No detected Hansen/UMD forest loss occurred at the queried site after the selected cutoff year.**
 
-The forest-loss evidence comes from the **Global Forest Watch Data API**, querying the **Hansen/UMD Global Forest Change 2024 v1.12 tree-cover-loss dataset**. The dataset is derived from Landsat time series and covers forest-loss events from 2001 through 2024. The official dataset describes loss as a stand-replacement disturbance / forest-to-nonforest change indicator. urlHansen/UMD Global Forest Change 2024 v1.12 documentationhttps://storage.googleapis.com/earthenginepartners-hansen/GFC-2024-v1.12/download.html
+GreenProof uses the **Hansen/UMD Global Forest Change 2024 v1.12** `lossyear` raster from the official University of Maryland GLAD archive. It is derived from Landsat time-series imagery, covers 2000-2024, uses 10° x 10° tiles, and has approximately 30 m pixels at the equator. The official dataset defines `lossyear` as a gross forest-cover loss indicator, with values 1-24 representing detected loss primarily in 2001-2024 and 0 meaning no detected loss. The dataset is publicly downloadable and does not require a GFW API key. urlOfficial Hansen GFC 2024 v1.12 documentationhttps://storage.googleapis.com/earthenginepartners-hansen/GFC-2024-v1.12/download.html
 
-The GFW Data API requires an account/API key. The application fails closed when the key is missing or the provider fails. It never substitutes a successful or fabricated result. urlGlobal Forest Watch Data API documentationhttps://data-api.globalforestwatch.org/
+The backend downloads only the relevant `lossyear` tile on first use and caches it under `data/hansen`. It then reads a bounded 1x1 GeoTIFF window at the private coordinate instead of decoding the entire raster into memory.
 
 ## Architecture
 
@@ -20,10 +20,10 @@ The GFW Data API requires an account/API key. The application fails closed when 
 Private coordinate + cutoff year
             │
             ▼
-Backend live environmental lookup
+Rust backend
             │
-            ├── Hansen/UMD GFC via GFW Data API
-            │     └── forest-loss years after cutoff
+            ├── Hansen/UMD GFC 2024 v1.12
+            │     └── loss-year GeoTIFF pixel
             ├── ESA WorldCover 2021
             │     └── land-cover class
             └── OSM Overpass
@@ -32,7 +32,7 @@ Backend live environmental lookup
             ▼
 Deterministic normalized evidence
             │
-            ├── first detected loss year after cutoff (or 0)
+            ├── Hansen loss year after cutoff (or 0)
             ├── protected flag
             └── land-cover code
             │
@@ -40,7 +40,7 @@ Deterministic normalized evidence
 Poseidon(5) evidence commitment
             │
             ▼
-Browser Groth16 proof
+Groth16 proof
             │
             ├── private coordinate
             ├── private quantity
@@ -48,10 +48,10 @@ Browser Groth16 proof
             └── private environmental witness
             │
             ▼
-Auditor sees proof + public policy + provenance
+Verifier receives proof + public policy
 ```
 
-### Evidence commitment
+## Evidence commitment
 
 The backend computes:
 
@@ -65,76 +65,71 @@ Poseidon(
 )
 ```
 
-`firstLossYearAfterCutoff = 0` means the live GFW query returned no detected loss after the selected cutoff. Otherwise it is the earliest detected loss year in the queried area after the cutoff.
+`firstLossYearAfterCutoff = 0` means the Hansen pixel contains no detected loss after the selected cutoff. Otherwise it contains the detected loss year.
 
-The browser recomputes the same Poseidon commitment from its private coordinate and the backend-issued normalized evidence. A mismatch stops proof generation.
+The browser recomputes the same commitment from the private coordinate and backend-issued evidence. A mismatch stops proof generation.
 
-### What the circuit proves
+## What the ZK circuit proves
 
-The Circom/Groth16 circuit proves all of the following for the private witness:
+The Circom/Groth16 circuit proves that the private witness:
 
-1. the coordinate is inside the configured public sourcing region;
-2. the protected-area flag is compliant;
-3. the land-cover code matches the public policy;
-4. private quantity is below the public threshold;
-5. supplier commitment is correct;
-6. `firstLossYearAfterCutoff` does not represent a loss after the selected cutoff;
-7. the private coordinate/environmental witness matches the public Poseidon evidence commitment.
+1. lies inside the configured public sourcing region;
+2. satisfies the protected-area policy;
+3. has the permitted land-cover code;
+4. satisfies the quantity threshold;
+5. satisfies the supplier commitment;
+6. has no Hansen loss year after the selected cutoff;
+7. matches the public Poseidon evidence commitment.
 
-The exact coordinate, quantity, supplier ID and secret are private witness values and are not contained in the proof or public signals.
+The exact coordinate, quantity, supplier ID and secret are private witness values.
 
-## Important cryptographic boundary
+## Cryptographic boundary
 
-The SNARK does **not** download or independently verify satellite data inside the circuit. That would be impractical for this hackathon architecture.
-
-Instead:
+The SNARK does **not** independently verify the external satellite dataset inside the circuit. The practical architecture is:
 
 ```text
-real provider response
+real Hansen GeoTIFF
        ↓
-deterministic backend normalization
+deterministic pixel extraction
+       ↓
+normalized evidence
        ↓
 Poseidon commitment
        ↓
-SNARK proves private witness == committed evidence
+Groth16 proves private witness == committed evidence
        ↓
-SNARK proves policy predicate
+Groth16 proves policy predicate
 ```
 
-Therefore the cryptographic guarantee is:
-
-> Given the backend-issued evidence commitment, the Groth16 proof demonstrates that the private coordinate/environmental witness bound to that commitment satisfies the configured policy.
-
-It does **not** prove that Hansen/GFW is complete, that every physical tree was observed, that the provider cannot be wrong, or that a regulator would accept the result as legal EUDR certification.
+Therefore the proof guarantees that the committed environmental observation and private coordinate are internally consistent and satisfy the circuit policy. It does not prove that Hansen is complete or error-free, that every tree on a parcel was observed, or that a regulator would accept the result as legal certification.
 
 ## Environmental sources
 
-| Source | Role | Real data? |
-|---|---|---|
-| Hansen/UMD Global Forest Change 2024 v1.12 via GFW Data API | Historical forest-loss verification | Yes |
-| ESA WorldCover 2021 v200 | Satellite-derived 10 m land-cover classification | Yes |
-| OpenStreetMap Overpass | Protected-area tag proxy | Yes |
-| Nominatim | Reverse geocoding | Yes |
+| Source | Role | Real data | Credential |
+|---|---|---:|---|
+| Hansen/UMD GFC 2024 v1.12 | Historical forest-loss verification | Yes | None |
+| ESA WorldCover 2021 v200 | Satellite-derived land-cover classification | Yes | None |
+| OpenStreetMap Overpass | Protected-area tag proxy | Yes | None |
+| Nominatim | Reverse geocoding | Yes | None |
 
-ESA WorldCover remains a secondary land-cover signal. It is not used as a substitute for historical forest-loss data.
+Hansen is the primary forest-loss source. WorldCover is only a secondary land-cover signal and is not used as a substitute for historical forest-loss data.
 
 ## Cutoff semantics
 
 The UI accepts a cutoff year from **2001 through 2024**.
 
-For example:
+Example:
 
 ```text
-cutoff = 2020
-GFW detected loss years = none after 2020
+lossyear = 0, cutoff = 2020
 => forestLossOk = 1
 
-cutoff = 2020
-GFW detected loss year = 2023
+lossyear = 23, cutoff = 2020
+=> detected loss year = 2023
 => forestLossOk = 0
 ```
 
-The GFW query uses a small deterministic polygon around the supplied coordinate because the raster query API requires a geometry. The public verification result does not expose that coordinate.
+The current predicate is pixel-level. It does not claim that an entire farm polygon has no forest loss.
 
 ## Setup
 
@@ -145,7 +140,8 @@ Requirements:
 - npm
 - Circom >= 2.1.6
 - network access
-- a Global Forest Watch Data API key
+
+No Global Forest Watch account or API key is required.
 
 ### 1. Configure the environment
 
@@ -153,13 +149,7 @@ Requirements:
 cp .env.example .env
 ```
 
-Set:
-
-```text
-GLOBAL_FOREST_WATCH_API_KEY=your_real_key
-```
-
-The official GFW documentation explains account/API-key creation. urlGFW Data API authentication guidehttps://developer.openepi.io/how-tos/getting-started-using-global-forest-watch-data-api
+The default configuration uses the public Hansen archive and caches downloaded tiles under `data/hansen`.
 
 ### 2. Build the circuit
 
@@ -197,90 +187,63 @@ Open the Vite URL.
 3. Select a cutoff year, for example `2020`.
 4. Enter quantity, supplier ID and supplier secret.
 5. Click **Check environmental evidence**.
-6. The backend queries live GFW/Hansen forest-loss data, ESA WorldCover and Overpass.
-7. Confirm the evidence card shows the actual GFW dataset and detected loss result.
+6. The backend queries real Hansen/UMD data, ESA WorldCover and Overpass.
+7. Review the forest-loss dataset and detected loss result.
 8. Click **Generate zero-knowledge proof**.
-9. The browser recomputes the Poseidon evidence commitment and generates a real Groth16 proof.
+9. The browser recomputes the Poseidon evidence commitment and generates a Groth16 proof.
 10. Click **Verify & create share link**.
 11. Open the verification ID as an auditor.
 
-If the GFW API is unavailable, the environmental lookup fails. There is no mock-data path.
+If an environmental source fails, GreenProof fails closed. It never substitutes mock or fabricated environmental evidence.
 
 ## Tests
 
-### Backend
+Backend:
 
 ```bash
 cd backend
 cargo test
 ```
 
-### Frontend
+Frontend:
 
 ```bash
 cd frontend
 npm run build
 ```
 
-### Circuit + Groth16
+Circuit + Groth16:
 
 ```bash
 cd scripts
 npx mocha test/circuit.test.js --timeout 120000
 ```
 
-The circuit tests cover:
+The backend also contains a Hansen tile-selection test, including negative-longitude tile handling.
 
-- valid no-loss proof;
-- detected loss after cutoff;
-- cutoff policy behavior;
-- protected-area failure;
-- quantity failure;
-- evidence-commitment mismatch;
-- proof tampering;
-- public-signal tampering;
-- absence of private witness values from auditor artifacts.
+## Direct Hansen source
 
-## Direct environmental API test
+For manual inspection, the official archive exposes individual 10° x 10° `lossyear` GeoTIFFs. For example, the archive documents URLs such as:
 
-After configuring `GLOBAL_FOREST_WATCH_API_KEY`, test the same GFW endpoint independently:
-
-```bash
-curl -X POST \
-  'https://data-api.globalforestwatch.org/dataset/umd_tree_cover_loss/v1.12/query/json' \
-  -H "x-api-key: $GLOBAL_FOREST_WATCH_API_KEY" \
-  -H 'Content-Type: application/json' \
-  --data-raw '{
-    "sql": "SELECT umd_tree_cover_loss__year AS year, SUM(area__ha) AS area_ha FROM results WHERE umd_tree_cover_loss__year > 2020 GROUP BY umd_tree_cover_loss__year ORDER BY umd_tree_cover_loss__year ASC",
-    "geometry": {
-      "type": "Polygon",
-      "coordinates": [[
-        [-1.61635, 6.66655],
-        [-1.61625, 6.66655],
-        [-1.61625, 6.66665],
-        [-1.61635, 6.66665],
-        [-1.61635, 6.66655]
-      ]]
-    }
-  }'
+```text
+https://storage.googleapis.com/earthenginepartners-hansen/GFC-2024-v1.12/Hansen_GFC-2024-v1.12_lossyear_40N_080W.tif
 ```
 
-The API documentation specifies that raster datasets require a geometry and that `umd_tree_cover_loss__year` and `area__ha` are queryable fields. citeturn3view0
+GreenProof constructs the corresponding tile URL from the private coordinate. urlHansen GFC download pagehttps://storage.googleapis.com/earthenginepartners-hansen/GFC-2024-v1.12/download.html
 
 ## Security and privacy limitations
 
-- The current demo sends the exact coordinate to the backend because the backend performs the live environmental lookup. The final verification record does not store the coordinate.
-- The GFW API key must remain server-side. Do not expose it through Vite or browser environment variables.
-- Evidence sessions are short-lived and one-time-use in an in-memory store.
+- The exact coordinate is sent to the backend because the backend performs the environmental lookup. The final verification record does not expose it.
+- The Hansen tile cache contains environmental raster data, not a database of submitted coordinates.
+- Evidence sessions are short-lived and one-time-use in the in-memory store.
 - The proof hides private witness values, but public policy values and the evidence commitment remain visible.
-- The forest-loss query covers a small deterministic area around the coordinate rather than a full farm polygon. This is a prototype predicate, not parcel-level legal certification.
-- Hansen/UMD GFC is a forest-loss indicator derived from Landsat time series. It should not be described as a guarantee of legal deforestation-free status.
-- The dataset documentation itself notes methodological differences across years and cautions against treating pixel counts as definitive area estimates.
+- The forest-loss query samples the Hansen pixel containing the coordinate rather than a full farm polygon.
+- Hansen/UMD GFC is a forest-loss indicator from Landsat time-series analysis, not a legal determination of deforestation-free status. The dataset documentation also warns about temporal methodological differences and limitations in using pixel counts as definitive area estimates. citeturn0search0
 
 ## Project scope
 
-GreenProof demonstrates a narrower claim than an EUDR certification system:
+GreenProof demonstrates this narrower claim:
 
-> **A supplier can prove, without disclosing the exact site, that a real environmental evidence lookup produced a forest-loss result compatible with a public cutoff policy.**
+> **A supplier can prove, without disclosing the exact site to the final verifier, that a real Hansen/UMD environmental lookup produced a forest-loss observation compatible with a public cutoff policy.**
 
-That is the cryptographic/privacy contribution of the prototype.
+The environmental observation comes from a real public dataset; the ZK layer proves consistency of the private witness with the committed observation and proves the policy predicate.
