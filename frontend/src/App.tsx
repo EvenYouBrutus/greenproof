@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { MapContainer, TileLayer, Marker, Popup } from "react-leaflet";
+import { MapContainer, TileLayer, Marker, Popup, useMap, useMapEvents } from "react-leaflet";
 import { generateProof, verifyProofLocally, type RegionConfig } from "./lib/zk";
 import "./app.css";
 
@@ -553,16 +553,19 @@ function SupplierView({ onVerificationCreated }: { onVerificationCreated: (id: s
             <StatusBadge tone="private">Not shared</StatusBadge>
           </div>
           {mapValid ? (
-            <MapContainer key={`${lat},${lon}`} center={[lat, lon]} zoom={9} style={{ height: 360, width: "100%" }}>
+            <MapContainer center={[lat, lon]} zoom={9} style={{ height: 360, width: "100%" }}>
               <TileLayer
                 attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
                 url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
               />
-              <Marker position={[lat, lon]}>
-                <Popup>
-                  Exact supplier-entered coordinate. This map is not shown in the auditor verification.
-                </Popup>
-              </Marker>
+              <MapController
+                lat={lat}
+                lon={lon}
+                onLocationSelect={(newLat, newLon) => {
+                  setLatitude(newLat.toFixed(6));
+                  setLongitude(newLon.toFixed(6));
+                }}
+              />
             </MapContainer>
           ) : (
             <div className="map-placeholder">Enter a valid latitude and longitude.</div>
@@ -796,6 +799,28 @@ function Check({ label, pass }: { label: string; pass: boolean }) {
         <small>{pass ? "Pass" : "Not disclosed"}</small>
       </div>
     </div>
+  );
+}
+
+function MapController({ lat, lon, onLocationSelect }: { lat: number; lon: number; onLocationSelect: (lat: number, lon: number) => void }) {
+  const map = useMap();
+
+  useMapEvents({
+    click(e) {
+      onLocationSelect(e.latlng.lat, e.latlng.lng);
+    },
+  });
+
+  useEffect(() => {
+    map.setView([lat, lon], map.getZoom());
+  }, [lat, lon, map]);
+
+  return (
+    <Marker position={[lat, lon]}>
+      <Popup>
+        Exact supplier-entered coordinate. This map is not shown in the auditor verification.
+      </Popup>
+    </Marker>
   );
 }
 
