@@ -1,25 +1,14 @@
 pragma circom 2.1.6;
 
 // GreenProof environmental compliance circuit.
-//
-// The environmental provider is external to the SNARK. The backend queries
-// real environmental data, normalizes it deterministically, and commits to
-// the result. The circuit proves that the private coordinate and environmental
-// witness are bound to that backend-issued commitment and that the committed
-// forest-loss result satisfies the public cutoff policy.
-//
-// It does NOT prove that the external dataset is truthful or complete.
+// External environmental data is queried by the backend, normalized, and
+// committed into evidenceHash. The circuit proves consistency of the private
+// coordinate/environmental witness with that commitment and evaluates the
+// public policy. It does not independently verify an external provider.
 
 include "circomlib/circuits/poseidon.circom";
 include "circomlib/circuits/comparators.circom";
 
-// Private witness:
-//   latEnc, lonEnc, quantity, supplierId, supplierSecret,
-//   protectedFlag, landCoverCode, firstLossYearAfterCutoff
-//
-// Public policy/evidence:
-//   region bounds, quantity threshold, allowed land-cover code,
-//   cutoffYear, supplier commitment, evidence hash.
 template EnvironmentalCompliance(bits) {
     signal input latEnc;
     signal input lonEnc;
@@ -50,7 +39,6 @@ template EnvironmentalCompliance(bits) {
     signal output valid;
 
     protectedFlag * (protectedFlag - 1) === 0;
-    firstLossYearAfterCutoff * (firstLossYearAfterCutoff - 0) === firstLossYearAfterCutoff * firstLossYearAfterCutoff;
 
     component geLat = GreaterEqThan(bits);
     geLat.in[0] <== latEnc;
@@ -81,16 +69,15 @@ template EnvironmentalCompliance(bits) {
     commitEq.in[0] <== commitHasher.out;
     commitEq.in[1] <== supplierCommitment;
 
-    // Backend encodes "no detected loss after cutoff" as firstLossYear=0.
-    // If a loss exists after the cutoff, firstLossYear is its earliest year.
-    // Therefore forestLossOk = NOT(firstLossYear > cutoffYear).
+    // Backend uses firstLossYearAfterCutoff = 0 when no loss was detected.
+    // If loss exists, it is the earliest detected loss year after cutoff.
     component lossAfterCutoff = GreaterThan(bits);
     lossAfterCutoff.in[0] <== firstLossYearAfterCutoff;
     lossAfterCutoff.in[1] <== cutoffYear;
     forestLossOk <== 1 - lossAfterCutoff.out;
 
-    // Bind all environmental facts, including the loss-year result, to the
-    // public evidence commitment. The exact coordinates remain private.
+    // The evidence commitment binds the private coordinate and normalized
+    // environmental observations, including the loss-year result.
     component evidenceHasher = Poseidon(5);
     evidenceHasher.inputs[0] <== latEnc;
     evidenceHasher.inputs[1] <== lonEnc;
@@ -117,7 +104,6 @@ template EnvironmentalCompliance(bits) {
     signal c3;
     signal c4;
     signal c5;
-    signal c6;
     c1 <== regionOk * protectedAreaOk;
     c2 <== c1 * landCoverOk;
     c3 <== c2 * quantityOk;
