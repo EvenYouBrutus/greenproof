@@ -1,5 +1,5 @@
 {
-  "_comment": "SYNTHETIC TEST FIXTURE - not real supplier data. See data/README.md.",
+  "_comment": "Synthetic proof-input fixture only. Real environmental evidence must come from backend/src/geo.rs live providers.",
   "private": {
     "latitude": 6.6666,
     "longitude": -1.6163,
@@ -10,11 +10,13 @@
   "publicConfig": {
     "region": { "minLat": 4.0, "maxLat": 11.5, "minLon": -8.6, "maxLon": 1.5 },
     "quantityThresholdKg": 5000,
-    "allowedLandCoverCode": 40
+    "allowedLandCoverCode": 40,
+    "cutoffYear": 2020
   },
   "evidence": {
-    "_comment": "In the real app this comes from backend/src/geo.rs's live lookup, not from this file.",
+    "_comment": "Must be obtained from the real backend lookup. firstLossYearAfterCutoff=0 means no detected loss after the cutoff.",
     "protectedFlag": 0,
-    "landCoverCode": 40
+    "landCoverCode": 40,
+    "firstLossYearAfterCutoff": 0
   }
 }

@@ -1,164 +1,56 @@
 #!/usr/bin/env node
-// GreenProof - real Groth16 proof generation
-//
-// Usage:
-//   node prove.js path/to/request.json
-//
-// request.json shape (see data/example-request.json for a template):
-// {
-//   "private": {
-//     "latitude": 6.6666,
-//     "longitude": -1.6163,
-//     "quantityKg": 1200,
-//     "supplierId": "12345",
-//     "supplierSecret": "some-long-random-secret"
-//   },
-//   "publicConfig": {
-//     "region": { "minLat": 4.5, "maxLat": 11.5, "minLon": -3.5, "maxLon": 1.5 },
-//     "quantityThresholdKg": 5000,
-//     "allowedLandCoverCode": 40
-//   },
-//   "evidence": {
-//     "protectedFlag": 0,
-//     "landCoverCode": 40
-//   }
-// }
-//
-// "evidence" MUST come from scripts/lib or backend/src/geo.rs real lookups
-// against Nominatim / Overpass (OSM protected areas) / land-cover source -
-// this script does not fetch it itself, to keep proving deterministic and
-// testable; see backend for the live query path used by the actual app.
-
+// GreenProof Groth16 proof generation.
+// Environmental evidence must come from the backend's live provider lookup.
 const fs = require("fs");
 const path = require("path");
 const snarkjs = require("snarkjs");
-const { poseidon2, poseidon4 } = require("poseidon-lite");
-const { encodeLat, encodeLon, boundingBoxEnc } = require("./lib/encode");
+const { poseidon2, poseidon5 } = require("poseidon-lite");
+const { boundingBoxEnc, encodeLat, encodeLon } = require("./lib/encode");
 
 async function main() {
   const reqPath = process.argv[2];
-  if (!reqPath) {
-    console.error("Usage: node prove.js <request.json> [outDir]");
-    process.exit(1);
-  }
+  if (!reqPath) { console.error("Usage: node prove.js <request.json> [outDir]"); process.exit(1); }
   const outDir = process.argv[3] || path.join(__dirname, "..", "circuits", "build", "out");
   fs.mkdirSync(outDir, { recursive: true });
-
   const req = JSON.parse(fs.readFileSync(reqPath, "utf8"));
-  const priv = req.private;
-  const cfg = req.publicConfig;
-  const evidence = req.evidence;
+  const priv = req.private, cfg = req.publicConfig, evidence = req.evidence;
+  for (const [k,v] of Object.entries({latitude:priv.latitude,longitude:priv.longitude,quantityKg:priv.quantityKg,supplierId:priv.supplierId,supplierSecret:priv.supplierSecret})) if(v===undefined||v===null) throw new Error(`Missing private field: ${k}`);
+  if(priv.latitude < -90 || priv.latitude > 90 || !Number.isFinite(priv.latitude)) throw new Error("INVALID LATITUDE");
+  if(priv.longitude < -180 || priv.longitude > 180 || !Number.isFinite(priv.longitude)) throw new Error("INVALID LONGITUDE");
+  const cutoffYear = Number(cfg.cutoffYear);
+  if(!Number.isInteger(cutoffYear) || cutoffYear < 2001 || cutoffYear > 2024) throw new Error("INVALID FOREST-LOSS CUTOFF YEAR");
+  if(!evidence || !Number.isInteger(Number(evidence.firstLossYearAfterCutoff)) || Number(evidence.firstLossYearAfterCutoff) < 0) throw new Error("INVALID FOREST-LOSS EVIDENCE");
 
-  // ---- basic input validation (fail loudly, do not silently coerce) ----
-  for (const [k, v] of Object.entries({
-    latitude: priv.latitude,
-    longitude: priv.longitude,
-    quantityKg: priv.quantityKg,
-    supplierId: priv.supplierId,
-    supplierSecret: priv.supplierSecret,
-  })) {
-    if (v === undefined || v === null) throw new Error(`Missing private field: ${k}`);
-  }
-  if (priv.latitude < -90 || priv.latitude > 90) throw new Error("INVALID LATITUDE");
-  if (priv.longitude < -180 || priv.longitude > 180) throw new Error("INVALID LONGITUDE");
+  const latEnc=encodeLat(priv.latitude), lonEnc=encodeLon(priv.longitude);
+  const {latMin,latMax,lonMin,lonMax}=boundingBoxEnc(cfg.region.minLat,cfg.region.maxLat,cfg.region.minLon,cfg.region.maxLon);
+  function strToField(s){let x=0n;for(const ch of Buffer.from(String(s),"utf8"))x=(x*256n+BigInt(ch))%(2n**200n);return x;}
+  const supplierIdF=strToField(priv.supplierId), supplierSecretF=strToField(priv.supplierSecret);
+  const supplierCommitment=poseidon2([supplierIdF,supplierSecretF]);
+  const protectedFlag=evidence.protectedFlag?1n:0n;
+  const landCoverCode=BigInt(evidence.landCoverCode);
+  const firstLossYear=BigInt(evidence.firstLossYearAfterCutoff);
+  const evidenceHash=poseidon5([latEnc,lonEnc,protectedFlag,landCoverCode,firstLossYear]);
+  if(req.evidenceHash && req.evidenceHash !== evidenceHash.toString()) throw new Error("ENVIRONMENTAL EVIDENCE COMMITMENT MISMATCH");
 
-  const latEnc = encodeLat(priv.latitude);
-  const lonEnc = encodeLon(priv.longitude);
-  const { latMin, latMax, lonMin, lonMax } = boundingBoxEnc(
-    cfg.region.minLat, cfg.region.maxLat, cfg.region.minLon, cfg.region.maxLon
-  );
+  const failures=[];
+  if(!(latEnc>=latMin&&latEnc<=latMax))failures.push("LOCATION OUTSIDE SUPPORTED REGION (latitude)");
+  if(!(lonEnc>=lonMin&&lonEnc<=lonMax))failures.push("LOCATION OUTSIDE SUPPORTED REGION (longitude)");
+  if(protectedFlag!==0n)failures.push("PROTECTED AREA DETECTED");
+  if(Number(landCoverCode)!==cfg.allowedLandCoverCode)failures.push("LAND COVER CLASSIFICATION NOT PERMITTED");
+  if(priv.quantityKg>cfg.quantityThresholdKg)failures.push("PRODUCTION THRESHOLD FAILED");
+  if(firstLossYear!==0n)failures.push(`FOREST LOSS DETECTED AFTER CUTOFF (first detected year: ${firstLossYear})`);
 
-  // supplierId/secret must be field elements: hash arbitrary strings down
-  // with a non-cryptographic-but-deterministic string->BigInt fold so any
-  // real identifier/secret string can be used (no fabricated numeric IDs).
-  function strToField(s) {
-    let x = 0n;
-    for (const ch of Buffer.from(String(s), "utf8")) {
-      x = (x * 256n + BigInt(ch)) % (2n ** 200n); // stay well under BN254 field size
-    }
-    return x;
-  }
-  const supplierIdF = strToField(priv.supplierId);
-  const supplierSecretF = strToField(priv.supplierSecret);
-  const supplierCommitment = poseidon2([supplierIdF, supplierSecretF]);
-
-  const protectedFlag = evidence.protectedFlag ? 1 : 0;
-  const landCoverCode = evidence.landCoverCode;
-  const evidenceHash = poseidon4([latEnc, lonEnc, protectedFlag, landCoverCode]);
-
-  // ---- pre-flight human-readable checks (before the circuit rejects it) ----
-  const failures = [];
-  if (!(latEnc >= latMin && latEnc <= latMax)) failures.push("LOCATION OUTSIDE SUPPORTED REGION (latitude)");
-  if (!(lonEnc >= lonMin && lonEnc <= lonMax)) failures.push("LOCATION OUTSIDE SUPPORTED REGION (longitude)");
-  if (protectedFlag !== 0) failures.push("PROTECTED AREA DETECTED");
-  if (landCoverCode !== cfg.allowedLandCoverCode) failures.push("LAND COVER CLASSIFICATION NOT PERMITTED");
-  if (!(priv.quantityKg <= cfg.quantityThresholdKg)) failures.push("PRODUCTION THRESHOLD FAILED");
-
-  const input = {
-    latEnc: latEnc.toString(),
-    lonEnc: lonEnc.toString(),
-    quantity: priv.quantityKg.toString(),
-    supplierId: supplierIdF.toString(),
-    supplierSecret: supplierSecretF.toString(),
-    protectedFlag: protectedFlag.toString(),
-    landCoverCode: landCoverCode.toString(),
-    latMin: latMin.toString(),
-    latMax: latMax.toString(),
-    lonMin: lonMin.toString(),
-    lonMax: lonMax.toString(),
-    quantityThreshold: cfg.quantityThresholdKg.toString(),
-    allowedLandCoverCode: cfg.allowedLandCoverCode.toString(),
-    supplierCommitment: supplierCommitment.toString(),
-    evidenceHash: evidenceHash.toString(),
-  };
-  fs.writeFileSync(path.join(outDir, "input.json"), JSON.stringify(input, null, 2));
-
-  if (failures.length > 0) {
-    console.warn("PRE-FLIGHT: the following policy checks will FAIL in the circuit (proof will still be generated):");
-    for (const f of failures) console.warn("  - " + f);
-  }
-
-  const buildDir = path.join(__dirname, "..", "circuits", "build");
-  const wasmPath = path.join(buildDir, "environmental_compliance_js", "environmental_compliance.wasm");
-  const zkeyPath = path.join(buildDir, "environmental_compliance_final.zkey");
-
-  if (!fs.existsSync(wasmPath) || !fs.existsSync(zkeyPath)) {
-    console.error(
-      `Missing compiled circuit artifacts. Run 'bash setup.sh' first.\n` +
-      `Expected:\n  ${wasmPath}\n  ${zkeyPath}`
-    );
-    process.exit(2);
-  }
-
-  try {
-    const { proof, publicSignals } = await snarkjs.groth16.fullProve(input, wasmPath, zkeyPath);
-    fs.writeFileSync(path.join(outDir, "proof.json"), JSON.stringify(proof, null, 2));
-    fs.writeFileSync(path.join(outDir, "public.json"), JSON.stringify(publicSignals, null, 2));
-
-    // Parse circuit output signals for compliance status
-    const valid = publicSignals[0] === "1";
-    const checkNames = ["valid", "regionOk", "protectedAreaOk", "landCoverOk", "quantityOk", "supplierOk", "evidenceOk"];
-    console.log("PROOF GENERATED:", path.join(outDir, "proof.json"));
-    console.log("PUBLIC SIGNALS:", path.join(outDir, "public.json"));
-    console.log("COMPLIANCE STATUS:", valid ? "COMPLIANT" : "NOT COMPLIANT");
-    console.log("Circuit output signals:");
-    for (let i = 0; i < 7; i++) {
-      console.log(`  ${checkNames[i]}: ${publicSignals[i] === "1" ? "PASS" : "FAIL"}`);
-    }
-    console.log(
-      "Public signals disclosed to the auditor include: compliance check results, latMin/latMax/lonMin/lonMax, " +
-      "quantityThreshold, allowedLandCoverCode, supplierCommitment, evidenceHash. " +
-      "Exact latitude/longitude/quantity/supplierId/supplierSecret " +
-      "are never included."
-    );
-  } catch (err) {
-    console.error("PROOF GENERATION FAILED - unexpected error (evidence hash mismatch?).");
-    console.error(String(err.message || err));
-    process.exit(3);
-  }
+  const input={latEnc:latEnc.toString(),lonEnc:lonEnc.toString(),quantity:String(priv.quantityKg),supplierId:supplierIdF.toString(),supplierSecret:supplierSecretF.toString(),protectedFlag:protectedFlag.toString(),landCoverCode:landCoverCode.toString(),firstLossYearAfterCutoff:firstLossYear.toString(),latMin:latMin.toString(),latMax:latMax.toString(),lonMin:lonMin.toString(),lonMax:lonMax.toString(),quantityThreshold:String(cfg.quantityThresholdKg),allowedLandCoverCode:String(cfg.allowedLandCoverCode),cutoffYear:String(cutoffYear),supplierCommitment:supplierCommitment.toString(),evidenceHash:evidenceHash.toString()};
+  fs.writeFileSync(path.join(outDir,"input.json"),JSON.stringify(input,null,2));
+  if(failures.length) { console.warn("PRE-FLIGHT POLICY FAILURES:"); failures.forEach(f=>console.warn("  - "+f)); }
+  const buildDir=path.join(__dirname,"..","circuits","build");
+  const wasmPath=path.join(buildDir,"environmental_compliance_js","environmental_compliance.wasm"), zkeyPath=path.join(buildDir,"environmental_compliance_final.zkey");
+  if(!fs.existsSync(wasmPath)||!fs.existsSync(zkeyPath)){console.error("Missing compiled circuit artifacts. Run bash setup.sh first.");process.exit(2);}
+  try{
+    const {proof,publicSignals}=await snarkjs.groth16.fullProve(input,wasmPath,zkeyPath);
+    fs.writeFileSync(path.join(outDir,"proof.json"),JSON.stringify(proof,null,2));fs.writeFileSync(path.join(outDir,"public.json"),JSON.stringify(publicSignals,null,2));
+    const names=["valid","regionOk","protectedAreaOk","landCoverOk","quantityOk","supplierOk","forestLossOk","evidenceOk"];
+    console.log("PROOF GENERATED:",path.join(outDir,"proof.json"));console.log("PUBLIC SIGNALS:",path.join(outDir,"public.json"));console.log("COMPLIANCE STATUS:",publicSignals[0]==="1"?"COMPLIANT":"NOT COMPLIANT");for(let i=0;i<8;i++)console.log(`  ${names[i]}: ${publicSignals[i]==="1"?"PASS":"FAIL"}`);
+  }catch(err){console.error("PROOF GENERATION FAILED:",String(err.message||err));process.exit(3)}
 }
-
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+main().catch(e=>{console.error(e);process.exit(1)});

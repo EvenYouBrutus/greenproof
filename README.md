@@ -2,227 +2,136 @@
 
 **Privacy-preserving environmental verification for commodity supply chains.**
 
-GreenProof is a hackathon prototype for cocoa supply chains. It demonstrates how a supplier can prove that a private set of facts satisfies public environmental constraints using a real Groth16 zero-knowledge proof, while an auditor receives only the verification result and public evidence provenance.
+GreenProof lets a supplier prove an environmental policy about a private site without revealing the exact coordinates to the final verifier.
 
-> **Prototype limitation:** GreenProof is not an official EUDR compliance or certification system. It does not independently establish legal compliance or deforestation-free status. Land cover is obtained from ESA WorldCover 2021 v200; this is a satellite-derived land-cover observation, not historical deforestation detection.
+## Forest-loss verification
 
-## The problem
+The environmental flow now includes a real historical forest-loss predicate:
 
-Environmental due diligence often requires sensitive supply-chain information:
+> **No detected Hansen/UMD forest loss occurred at the queried site after the selected cutoff year.**
 
-- exact farm/plot coordinates;
-- production volume;
-- supplier identity;
-- environmental evidence tied to that location.
+GreenProof uses the **Hansen/UMD Global Forest Change 2024 v1.12** `lossyear` raster from the official University of Maryland GLAD archive. It is derived from Landsat time-series imagery, covers 2000-2024, uses 10° x 10° tiles, and has approximately 30 m pixels at the equator. The official dataset defines `lossyear` as a gross forest-cover loss indicator, with values 1-24 representing detected loss primarily in 2001-2024 and 0 meaning no detected loss. The dataset is publicly downloadable and does not require a GFW API key. urlOfficial Hansen GFC 2024 v1.12 documentationhttps://storage.googleapis.com/earthenginepartners-hansen/GFC-2024-v1.12/download.html
 
-Suppliers may not want to expose commercially sensitive coordinates and volumes to every buyer, auditor, platform, or shared database.
-
-The key question is:
-
-> **Can a supplier prove that a claim about a hidden plot is true without handing over the hidden plot data?**
-
-GreenProof demonstrates that workflow with zero-knowledge proofs.
-
-## The solution
-
-The demo uses a single cocoa-supply-chain scenario.
-
-A supplier:
-
-1. enters a private plot coordinate;
-2. checks live environmental evidence;
-3. enters private production quantity and supplier credentials;
-4. generates a Groth16 proof locally in the browser;
-5. creates a verification ID.
-
-An auditor can then open the verification ID and see:
-
-- whether the cryptographic proof is valid;
-- environmental evidence provenance;
-- the public verification metadata.
-
-The auditor does **not** receive the exact coordinate, production quantity, or supplier secret.
-
-## What the prototype actually proves
-
-The Circom circuit constrains:
-
-1. private latitude/longitude are inside the public West African cocoa-region bounding box;
-2. the live evidence lookup did not detect a protected-area tag;
-3. the reported land-cover code equals the public allowed code;
-4. private production quantity is below the public threshold;
-5. the supplier knows the secret corresponding to the public supplier commitment;
-6. the private environmental witness is bound to the public evidence hash.
-
-This is a proof of the stated computational conditions. It is **not** a proof that OpenStreetMap is complete, that the evidence provider is truthful, or that the physical world matches the dataset.
-
-## Demo workflow
-
-```text
-SUPPLIER
-  │
-  ├─ private coordinates ────────────────┐
-  ├─ private quantity                    │
-  ├─ private supplier secret             │
-  │                                      │
-  ▼                                      │
-Live environmental lookup                │
-  │                                      │
-  ├─ protected-area evidence             │
-  └─ land-cover evidence                 │
-         │                               │
-         └──────────────┐                │
-                        ▼                │
-                 Browser-side ZK proof ◄─┘
-                        │
-                        ▼
-                 Groth16 proof
-                        │
-                        ▼
-                GreenProof ID
-                        │
-                        ▼
-                    AUDITOR
-                        │
-              ┌─────────┴─────────┐
-              ▼                   ▼
-        cryptographic        provenance
-        result: VALID        metadata
-              │
-              └── private witness remains hidden
-```
-
-The exact coordinate is currently sent temporarily to the backend because the MVP performs the live geospatial lookup server-side. The production quantity and supplier secret never enter that endpoint and are processed locally in the browser.
-
-## Environmental data sources
-
-| Source | Current role |
-|---|---|
-| Nominatim / OpenStreetMap | Reverse geocoding and place metadata |
-| Overpass API / OpenStreetMap | Protected-area tag proxy |
-| ESA WorldCover 2021 v200 | Primary satellite-derived 10 m land-cover class, based on Sentinel-1/Sentinel-2 |
-
-The app does not fabricate evidence when a live source fails. It returns an explicit error instead.
-
-### Important limitation
-
-ESA WorldCover classifies land cover for 2021; it is **not** a historical deforestation analysis. Do not describe the MVP as proving "deforestation-free" in the legal EUDR sense.
-
-A production version should replace/supplement this preprocessing step with authoritative environmental datasets, signed evidence attestations, and historical satellite analysis.
-
-## Why zero-knowledge proofs?
-
-A normal database can prove that disclosed data was stored or signed correctly. It does not let a verifier check a property of data that the verifier never receives.
-
-For example:
-
-```text
-Private:
-  exact plot = X
-  quantity = 1,200 kg
-  supplier secret = Y
-
-Public requirement:
-  quantity <= 5,000 kg
-
-ZK result:
-  "Yes, this hidden quantity satisfies the constraint."
-```
-
-That is the privacy property GreenProof is demonstrating.
+The backend downloads only the relevant `lossyear` tile on first use and caches it under `data/hansen`. It then reads a bounded 1x1 GeoTIFF window at the private coordinate instead of decoding the entire raster into memory.
 
 ## Architecture
 
-### Frontend
-
-- React
-- TypeScript
-- Vite
-- Leaflet / React-Leaflet
-- snarkjs
-- Poseidon
-
-### Backend
-
-- Rust
-- Axum
-- reqwest
-- Nominatim
-- Overpass API
-
-### Cryptography
-
-- Circom 2.1.6
-- Groth16
-- BN254
-- Poseidon
-- circomlib comparators
-
-Proof generation happens in the browser using WASM.
-
-Proof verification uses the standard `snarkjs groth16.verify` implementation through the Rust backend.
-
-## Verification IDs
-
-After a valid proof is generated, the frontend calls:
-
 ```text
-POST /api/verify-proof
+Private coordinate + cutoff year
+            │
+            ▼
+Rust backend
+            │
+            ├── Hansen/UMD GFC 2024 v1.12
+            │     └── loss-year GeoTIFF pixel
+            ├── ESA WorldCover 2021
+            │     └── land-cover class
+            └── OSM Overpass
+                  └── protected-area tags
+            │
+            ▼
+Deterministic normalized evidence
+            │
+            ├── Hansen loss year after cutoff (or 0)
+            ├── protected flag
+            └── land-cover code
+            │
+            ▼
+Poseidon(5) evidence commitment
+            │
+            ▼
+Groth16 proof
+            │
+            ├── private coordinate
+            ├── private quantity
+            ├── private supplier secret
+            └── private environmental witness
+            │
+            ▼
+Verifier receives proof + public policy
 ```
 
-The backend verifies the proof and creates an ID such as:
+## Evidence commitment
+
+The backend computes:
 
 ```text
-GP-8F3A91C2
+Poseidon(
+  encodedLatitude,
+  encodedLongitude,
+  protectedFlag,
+  landCoverCode,
+  firstLossYearAfterCutoff
+)
 ```
 
-The auditor can then open:
+`firstLossYearAfterCutoff = 0` means the Hansen pixel contains no detected loss after the selected cutoff. Otherwise it contains the detected loss year.
+
+The browser recomputes the same commitment from the private coordinate and backend-issued evidence. A mismatch stops proof generation.
+
+## What the ZK circuit proves
+
+The Circom/Groth16 circuit proves that the private witness:
+
+1. lies inside the configured public sourcing region;
+2. satisfies the protected-area policy;
+3. has the permitted land-cover code;
+4. satisfies the quantity threshold;
+5. satisfies the supplier commitment;
+6. has no Hansen loss year after the selected cutoff;
+7. matches the public Poseidon evidence commitment.
+
+The exact coordinate, quantity, supplier ID and secret are private witness values.
+
+## Cryptographic boundary
+
+The SNARK does **not** independently verify the external satellite dataset inside the circuit. The practical architecture is:
 
 ```text
-?verification=GP-8F3A91C2
+real Hansen GeoTIFF
+       ↓
+deterministic pixel extraction
+       ↓
+normalized evidence
+       ↓
+Poseidon commitment
+       ↓
+Groth16 proves private witness == committed evidence
+       ↓
+Groth16 proves policy predicate
 ```
 
-The demo backend stores only the proof, public signals and sanitized evidence provenance in an **in-memory store**. Exact coordinates are deliberately removed before the verification record is stored.
+Therefore the proof guarantees that the committed environmental observation and private coordinate are internally consistent and satisfy the circuit policy. It does not prove that Hansen is complete or error-free, that every tree on a parcel was observed, or that a regulator would accept the result as legal certification.
 
-This is suitable for a hackathon demo, not production persistence.
+## Environmental sources
 
-## Security / trust model
+| Source | Role | Real data | Credential |
+|---|---|---:|---|
+| Hansen/UMD GFC 2024 v1.12 | Historical forest-loss verification | Yes | None |
+| ESA WorldCover 2021 v200 | Satellite-derived land-cover classification | Yes | None |
+| OpenStreetMap Overpass | Protected-area tag proxy | Yes | None |
+| Nominatim | Reverse geocoding | Yes | None |
 
-GreenProof deliberately separates three things:
+Hansen is the primary forest-loss source. WorldCover is only a secondary land-cover signal and is not used as a substitute for historical forest-loss data.
 
-### 1. Cryptographic correctness
+## Cutoff semantics
 
-The Groth16 proof can be independently verified.
+The UI accepts a cutoff year from **2001 through 2024**.
 
-Tampering with the proof or public signals makes verification fail.
+Example:
 
-### 2. Evidence consistency
+```text
+lossyear = 0, cutoff = 2020
+=> forestLossOk = 1
 
-The backend normalizes the ESA WorldCover class and protected-area result, computes a Poseidon evidence hash over encoded coordinates and that compact claim, and issues a short-lived one-time evidence session. It accepts a proof only when the proof's public evidence hash and fixed public policy signals match that backend-issued session.
+lossyear = 23, cutoff = 2020
+=> detected loss year = 2023
+=> forestLossOk = 0
+```
 
-### 3. Environmental truth
+The current predicate is pixel-level. It does not claim that an entire farm polygon has no forest loss.
 
-This is **outside** the circuit.
-
-The system currently trusts the live environmental data returned by the configured public sources. A production deployment should require authenticated/signed evidence from trusted data providers.
-
-## What is intentionally not claimed
-
-GreenProof does not claim to:
-
-- provide official EUDR certification;
-- replace a Due Diligence Statement;
-- prove legality of harvest;
-- prove deforestation-free status from satellite imagery;
-- guarantee that OpenStreetMap tags are complete;
-- provide production-grade multi-party Groth16 setup;
-- replace established EUDR compliance platforms.
-
-The point of the prototype is narrower:
-
-> **Demonstrate minimal-disclosure environmental verification using zero-knowledge proofs.**
-
-## Running locally
+## Setup
 
 Requirements:
 
@@ -230,21 +139,36 @@ Requirements:
 - Node.js >= 18
 - npm
 - Circom >= 2.1.6
-- network access for public environmental APIs
+- network access
+
+No Global Forest Watch account or API key is required.
+
+### 1. Configure the environment
 
 ```bash
 cp .env.example .env
+```
 
+The default configuration uses the public Hansen archive and caches downloaded tiles under `data/hansen`.
+
+### 2. Build the circuit
+
+```bash
 cd scripts
 npm install
 bash setup.sh
 cd ..
-
 bash scripts/copy-artifacts-to-frontend.sh
+```
 
+### 3. Start the Rust backend
+
+```bash
 cd backend
 cargo run
 ```
+
+### 4. Start the frontend
 
 In another terminal:
 
@@ -254,115 +178,72 @@ npm install
 npm run dev
 ```
 
-Then open the Vite URL.
+Open the Vite URL.
 
-### Circuit artifacts
+## Complete demo
 
-The browser needs:
+1. Open **Supplier**.
+2. Enter/select a private coordinate.
+3. Select a cutoff year, for example `2020`.
+4. Enter quantity, supplier ID and supplier secret.
+5. Click **Check environmental evidence**.
+6. The backend queries real Hansen/UMD data, ESA WorldCover and Overpass.
+7. Review the forest-loss dataset and detected loss result.
+8. Click **Generate zero-knowledge proof**.
+9. The browser recomputes the Poseidon evidence commitment and generates a Groth16 proof.
+10. Click **Verify & create share link**.
+11. Open the verification ID as an auditor.
 
-```text
-frontend/public/circuit/environmental_compliance.wasm
-frontend/public/circuit/circuit_final.zkey
-frontend/public/circuit/verification_key.json
-```
-
-These are generated by the setup/copy scripts and are intentionally not committed as source files.
+If an environmental source fails, GreenProof fails closed. It never substitutes mock or fabricated environmental evidence.
 
 ## Tests
 
-Circuit tests use real Groth16 proving/verification rather than mocked cryptographic results:
-
-```bash
-cd scripts
-npx mocha test/circuit.test.js --timeout 12000
-```
-
-Backend tests:
+Backend:
 
 ```bash
 cd backend
 cargo test
 ```
 
-Frontend production build:
+Frontend:
 
 ```bash
 cd frontend
 npm run build
 ```
 
-## Hackathon demo
+Circuit + Groth16:
 
-The strongest demo is:
-
-### 1. Valid supplier
-
-```text
-Environmental checks
-✓ Supported region
-✓ Protected-area check
-✓ Allowed land cover
-✓ Quantity threshold
-
-Generate ZK proof
-        ↓
-VALID
+```bash
+cd scripts
+npx mocha test/circuit.test.js --timeout 120000
 ```
 
-### 2. Invalid supplier
+The backend also contains a Hansen tile-selection test, including negative-longitude tile handling.
 
-Change one condition, such as production quantity above the public threshold:
+## Direct Hansen source
 
-```text
-Quantity threshold
-✕
-
-Groth16 proof generation
-REJECTED
-```
-
-### 3. Tampering
-
-Modify a public signal or proof artifact:
+For manual inspection, the official archive exposes individual 10° x 10° `lossyear` GeoTIFFs. For example, the archive documents URLs such as:
 
 ```text
-Original proof
-✓ VALID
-
-Modified proof/public signal
-✕ INVALID
+https://storage.googleapis.com/earthenginepartners-hansen/GFC-2024-v1.12/Hansen_GFC-2024-v1.12_lossyear_40N_080W.tif
 ```
 
-This demonstrates that ZK is part of the verification mechanism rather than decorative cryptography.
+GreenProof constructs the corresponding tile URL from the private coordinate. urlHansen GFC download pagehttps://storage.googleapis.com/earthenginepartners-hansen/GFC-2024-v1.12/download.html
 
-## Roadmap
+## Security and privacy limitations
 
-### Hackathon MVP
+- The exact coordinate is sent to the backend because the backend performs the environmental lookup. The final verification record does not expose it.
+- The Hansen tile cache contains environmental raster data, not a database of submitted coordinates.
+- Evidence sessions are short-lived and one-time-use in the in-memory store.
+- The proof hides private witness values, but public policy values and the evidence commitment remain visible.
+- The forest-loss query samples the Hansen pixel containing the coordinate rather than a full farm polygon.
+- Hansen/UMD GFC is a forest-loss indicator from Landsat time-series analysis, not a legal determination of deforestation-free status. The dataset documentation also warns about temporal methodological differences and limitations in using pixel counts as definitive area estimates. citeturn0search0
 
-- [x] Real live geospatial lookup
-- [x] Browser-side Groth16 proof generation
-- [x] Real proof verification
-- [x] Privacy-preserving supplier witness
-- [x] Auditor verification flow
-- [x] Verification IDs
-- [x] Sanitized evidence provenance
-- [x] Valid/invalid demonstration path
+## Project scope
 
-### Production direction
+GreenProof demonstrates this narrower claim:
 
-- [ ] Authenticated/signed environmental evidence
-- [ ] Protected Planet / WDPA integration
-- [ ] Copernicus / Sentinel-derived land-cover and change detection
-- [ ] Historical baseline analysis
-- [ ] Polygon-level plot geometry
-- [ ] Multi-plot and aggregation proofs
-- [ ] Persistent verification registry
-- [ ] Multi-party trusted setup or a transparent proving system
-- [ ] Native Rust Groth16 verifier
-- [ ] Full EUDR due-diligence workflow and legal review
+> **A supplier can prove, without disclosing the exact site to the final verifier, that a real Hansen/UMD environmental lookup produced a forest-loss observation compatible with a public cutoff policy.**
 
-## License / attribution
-
-OpenStreetMap data is © OpenStreetMap contributors and subject to the Open Database License.
-
-This repository is a hackathon prototype and should not be treated as a production compliance service.
+The environmental observation comes from a real public dataset; the ZK layer proves consistency of the private witness with the committed observation and proves the policy predicate.
