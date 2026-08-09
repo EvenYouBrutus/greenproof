@@ -29,8 +29,19 @@ const WORKFLOW_STAGES = [
 ] as const;
 
 export default function App() {
-  const [tab, setTab] = useState<Tab>("supplier");
-  const [verificationId, setVerificationId] = useState<string | null>(null);
+  const [verificationId, setVerificationId] = useState<string | null>(() => {
+    if (typeof window !== "undefined") {
+      return new URLSearchParams(window.location.search).get("verification");
+    }
+    return null;
+  });
+
+  const [tab, setTab] = useState<Tab>(() => {
+    if (typeof window !== "undefined") {
+      return new URLSearchParams(window.location.search).get("verification") ? "auditor" : "supplier";
+    }
+    return "supplier";
+  });
 
   function handleVerificationCreated(id: string) {
     setVerificationId(id);
@@ -45,11 +56,11 @@ export default function App() {
 
   useEffect(() => {
     const id = new URLSearchParams(window.location.search).get("verification");
-    if (id) {
+    if (id && id !== verificationId) {
       setTab("auditor");
       setVerificationId(id);
     }
-  }, []);
+  }, [verificationId]);
 
   return (
     <div className="app-shell">
@@ -917,13 +928,64 @@ function AuditorView({ initialId }: { initialId: string | null }) {
   const [verifying, setVerifying] = useState(false);
   const [result, setResult] = useState<any>(null);
   const [error, setError] = useState<string | null>(null);
+  const [aiAnalysis, setAiAnalysis] = useState<any>(null);
+  const [aiLoading, setAiLoading] = useState(false);
 
   useEffect(() => {
-    if (initialId) {
-      setVerificationId(initialId);
-      loadVerification(initialId);
+    if (initialId && initialId.trim()) {
+      const cleanId = initialId.trim();
+      setVerificationId(cleanId);
+      loadVerification(cleanId);
     }
   }, [initialId]);
+
+  useEffect(() => {
+    if (result && result.zk_proof_valid) {
+      fetchAiAnalysis(result);
+    } else {
+      setAiAnalysis(null);
+    }
+  }, [result]);
+
+  async function fetchAiAnalysis(resData: any) {
+    setAiLoading(true);
+    try {
+      const status =
+        resData.compliance_status ||
+        (resData.public_signals && parseComplianceChecks(resData.public_signals as string[]).valid
+          ? "COMPLIANT"
+          : "NOT_COMPLIANT");
+      let failed: string[] = resData.failed_checks || [];
+      if (!failed.length && resData.public_signals) {
+        const checks = parseComplianceChecks(resData.public_signals as string[]);
+        if (!checks.regionOk) failed.push("Region check");
+        if (!checks.protectedAreaOk) failed.push("Protected area check");
+        if (!checks.landCoverOk) failed.push("Land cover check");
+        if (!checks.quantityOk) failed.push("Quantity threshold check");
+        if (!checks.supplierOk) failed.push("Supplier commitment check");
+        if (!checks.evidenceOk) failed.push("Evidence binding check");
+      }
+
+      const resp = await fetch(`${BACKEND_URL}/api/ai-audit`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          compliance_status: status,
+          failed_checks: failed,
+          evidence_dataset:
+            resData.evidence?.land_cover?.dataset || "ESA WorldCover / OpenStreetMap",
+        }),
+      });
+      const data = await resp.json();
+      if (data.ok) {
+        setAiAnalysis(data);
+      }
+    } catch (err) {
+      console.error("AI audit request failed", err);
+    } finally {
+      setAiLoading(false);
+    }
+  }
 
   async function loadVerification(id: string) {
     if (!id.trim()) return;
@@ -1178,6 +1240,41 @@ function AuditorView({ initialId }: { initialId: string | null }) {
                 </button>
               </div>
             )}
+            <div className="ai-audit-card" style={{ marginTop: "1.25rem", padding: "1.25rem", background: "var(--bg-subtle, rgba(255,255,255,0.03))", border: "1px solid var(--border)", borderRadius: "8px" }}>
+              <div className="card-header" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div>
+                  <p className="card-kicker" style={{ margin: 0, fontSize: "0.8rem", textTransform: "uppercase", letterSpacing: "0.05em", color: "var(--accent)" }}>AI Environmental Analysis</p>
+                  <h4 style={{ margin: "0.25rem 0 0" }}>Auditor Insights &amp; Risk Assessment</h4>
+                </div>
+                {aiAnalysis && (
+                  <StatusBadge tone={aiAnalysis.risk_level.includes("LOW") ? "success" : "warn"}>
+                    {aiAnalysis.risk_level}
+                  </StatusBadge>
+                )}
+              </div>
+              {aiLoading ? (
+                <p className="muted" style={{ padding: "0.75rem 0", margin: 0 }}>Generating AI analysis from public verification outputs…</p>
+              ) : aiAnalysis ? (
+                <div className="ai-audit-body" style={{ marginTop: "0.75rem" }}>
+                  <div className="ai-row" style={{ marginBottom: "0.75rem" }}>
+                    <strong style={{ display: "block", color: "var(--text-muted)", fontSize: "0.8rem", textTransform: "uppercase" }}>1. Compliance Explanation</strong>
+                    <p style={{ margin: "0.25rem 0 0", lineHeight: 1.5 }}>{aiAnalysis.summary}</p>
+                  </div>
+                  <div className="ai-row" style={{ marginBottom: "0.75rem" }}>
+                    <strong style={{ display: "block", color: "var(--text-muted)", fontSize: "0.8rem", textTransform: "uppercase" }}>2. Risk Summary</strong>
+                    <p style={{ margin: "0.25rem 0 0", lineHeight: 1.5 }}>{aiAnalysis.risk_level}</p>
+                  </div>
+                  <div className="ai-row" style={{ marginBottom: "0.75rem" }}>
+                    <strong style={{ display: "block", color: "var(--text-muted)", fontSize: "0.8rem", textTransform: "uppercase" }}>3. Recommended Action</strong>
+                    <p style={{ margin: "0.25rem 0 0", lineHeight: 1.5 }}>{aiAnalysis.recommended_action}</p>
+                  </div>
+                  <div className="ai-footer" style={{ borderTop: "1px solid var(--border)", paddingTop: "0.5rem", marginTop: "0.75rem", display: "flex", justifyContent: "space-between", fontSize: "0.75rem", color: "var(--text-muted)" }}>
+                    <span>Engine: {aiAnalysis.ai_model}</span>
+                    <span>Privacy: Zero private coordinates transmitted</span>
+                  </div>
+                </div>
+              ) : null}
+            </div>
 
             <details className="tech-details">
               <summary>Technical details</summary>

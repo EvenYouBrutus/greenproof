@@ -1,3 +1,4 @@
+mod ai;
 mod geo;
 mod time;
 mod verify;
@@ -510,6 +511,7 @@ async fn main() {
         .route("/api/check-location", post(check_location))
         .route("/api/verify-proof", post(verify_proof_handler))
         .route("/api/verifications/:id", get(get_verification))
+        .route("/api/ai-audit", post(ai::ai_audit_handler))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
