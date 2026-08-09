@@ -43,6 +43,8 @@ struct StoredVerification {
     verification_id: String,
     created_at: String,
     zk_proof_valid: bool,
+    compliance_status: String,
+    failed_checks: Vec<String>,
     proof: serde_json::Value,
     public_signals: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -146,6 +148,11 @@ async fn verify_proof_handler(
             Json(serde_json::json!({ "ok": false, "error": error })),
         );
     }
+
+    // Extract compliance status from circuit output signals before verification
+    let (compliance_status, failed_checks) =
+        extract_compliance_status(&req.public_signals);
+
     match verify::verify_proof(
         &state.scripts_dir,
         &state.vkey_path,
@@ -176,6 +183,8 @@ async fn verify_proof_handler(
                 verification_id: verification_id.clone(),
                 created_at: now_iso(),
                 zk_proof_valid: true,
+                compliance_status: compliance_status.clone(),
+                failed_checks: failed_checks.clone(),
                 proof: req.proof,
                 public_signals: req.public_signals,
                 evidence: Some(session.evidence),
@@ -202,6 +211,8 @@ async fn verify_proof_handler(
                     "zk_proof_valid": true,
                     "verification_id": verification_id,
                     "created_at": stored.created_at,
+                    "compliance_status": compliance_status,
+                    "failed_checks": failed_checks,
                     "private_coordinates_disclosed": false,
                     "private_quantity_disclosed": false,
                     "supplier_secret_disclosed": false
@@ -216,7 +227,8 @@ async fn verify_proof_handler(
 }
 
 const SESSION_TTL_SECS: u64 = 10 * 60;
-const EXPECTED_PUBLIC_SIGNALS: usize = 9;
+// 7 output signals + 8 public input signals = 15 total
+const EXPECTED_PUBLIC_SIGNALS: usize = 15;
 const DEFAULT_LAT_MIN: u64 = 94_000_000;
 const DEFAULT_LAT_MAX: u64 = 101_500_000;
 const DEFAULT_LON_MIN: u64 = 171_400_000;
@@ -292,33 +304,83 @@ fn take_evidence_session(state: &AppState, id: &str) -> Result<EvidenceSession, 
     sessions.remove(id).ok_or_else(|| "Evidence session not found, expired, or already used. Run the environmental lookup again.".to_string())
 }
 
+/// Extract compliance status and failed checks from the circuit's public output signals.
+///
+/// Public signals layout (outputs first, then public inputs):
+///   [0] valid, [1] regionOk, [2] protectedAreaOk, [3] landCoverOk,
+///   [4] quantityOk, [5] supplierOk, [6] evidenceOk,
+///   [7..14] public inputs
+fn extract_compliance_status(signals: &serde_json::Value) -> (String, Vec<String>) {
+    let signals = match signals.as_array() {
+        Some(a) => a,
+        None => return ("UNKNOWN".into(), vec![]),
+    };
+    let is_one = |idx: usize| signals.get(idx).and_then(|v| v.as_str()) == Some("1");
+
+    let check_names = [
+        (1, "Region check"),
+        (2, "Protected area check"),
+        (3, "Land cover check"),
+        (4, "Quantity threshold check"),
+        (5, "Supplier commitment check"),
+        (6, "Evidence binding check"),
+    ];
+    let failed: Vec<String> = check_names
+        .iter()
+        .filter(|(idx, _)| !is_one(*idx))
+        .map(|(_, name)| name.to_string())
+        .collect();
+
+    let status = if is_one(0) {
+        "COMPLIANT".to_string()
+    } else {
+        "NOT_COMPLIANT".to_string()
+    };
+    (status, failed)
+}
+
 fn validate_public_signals(signals: &serde_json::Value, evidence_hash: &str) -> Result<(), String> {
     let signals = signals
         .as_array()
         .ok_or_else(|| "public_signals must be an array".to_string())?;
     if signals.len() != EXPECTED_PUBLIC_SIGNALS {
-        return Err("unexpected public-signal count".into());
+        return Err(format!(
+            "unexpected public-signal count: expected {}, got {}",
+            EXPECTED_PUBLIC_SIGNALS,
+            signals.len()
+        ));
     }
-    let expected = [
-        "1".to_string(),
-        DEFAULT_LAT_MIN.to_string(),
-        DEFAULT_LAT_MAX.to_string(),
-        DEFAULT_LON_MIN.to_string(),
-        DEFAULT_LON_MAX.to_string(),
-        DEFAULT_QUANTITY_THRESHOLD.to_string(),
-        DEFAULT_ALLOWED_LAND_COVER.to_string(),
-    ];
-    for (index, value) in expected.iter().enumerate() {
-        if signals[index].as_str() != Some(value) {
-            return Err(format!(
-                "public signal {index} does not match the deployed GreenProof policy"
-            ));
+    // Output signals [0..6] are the circuit's compliance check results —
+    // they can be 0 or 1, and we validate them structurally (must be "0" or "1")
+    // but do NOT require them to be "1".
+    for i in 0..7 {
+        let val = signals[i].as_str().unwrap_or("");
+        if val != "0" && val != "1" {
+            return Err(format!("output signal {i} is not a valid boolean"));
         }
     }
-    if signals[8].as_str() != Some(evidence_hash) {
-        return Err(
-            "proof evidence hash does not match the backend-issued environmental evidence".into(),
-        );
+    // Public input signals [7..14] must match the deployed policy.
+    // Index mapping: 7=latMin, 8=latMax, 9=lonMin, 10=lonMax,
+    //                11=quantityThreshold, 12=allowedLandCoverCode,
+    //                13=supplierCommitment (any value), 14=evidenceHash
+    let policy_checks: [(usize, Option<String>); 8] = [
+        (7, Some(DEFAULT_LAT_MIN.to_string())),
+        (8, Some(DEFAULT_LAT_MAX.to_string())),
+        (9, Some(DEFAULT_LON_MIN.to_string())),
+        (10, Some(DEFAULT_LON_MAX.to_string())),
+        (11, Some(DEFAULT_QUANTITY_THRESHOLD.to_string())),
+        (12, Some(DEFAULT_ALLOWED_LAND_COVER.to_string())),
+        (13, None), // supplierCommitment — any value is acceptable
+        (14, Some(evidence_hash.to_string())),
+    ];
+    for (index, expected) in &policy_checks {
+        if let Some(ref exp) = expected {
+            if signals[*index].as_str() != Some(exp) {
+                return Err(format!(
+                    "public signal {index} does not match the deployed GreenProof policy"
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -351,6 +413,8 @@ async fn get_verification(
                     "verification_id": v.verification_id,
                     "created_at": v.created_at,
                     "zk_proof_valid": v.zk_proof_valid,
+                    "compliance_status": v.compliance_status,
+                    "failed_checks": v.failed_checks,
                     "evidence": v.evidence,
                     "public_signals": v.public_signals
                 })),

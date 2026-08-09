@@ -16,7 +16,7 @@ pragma circom 2.1.6;
 // The off-chain lookup produces an "evidence report":
 //   { latEnc, lonEnc, protectedFlag, landCoverCode, source metadata... }
 //
-// This circuit proves that:
+// This circuit evaluates whether:
 //   1. The supplier's PRIVATE coordinates fall inside a PUBLIC bounding box
 //      (the declared "supported geographic region", e.g. Ghana/Cote d'Ivoire
 //      cocoa belt bounds).
@@ -34,6 +34,10 @@ pragma circom 2.1.6;
 //      classification scheme in use).
 //   5. quantity <= a public threshold.
 //   6. Poseidon(supplierId, supplierSecret) == a public supplier commitment.
+//
+// Rather than rejecting non-compliant inputs, the circuit outputs the evaluation
+// results as public signals (e.g. regionOk, valid), enabling verifiers to
+// explicitly see which checks passed or failed.
 //
 // This circuit trusts that the off-chain evidence report faithfully reflects
 // the real datasets queried at query time (see README "Threat model" and
@@ -67,6 +71,12 @@ template EnvironmentalCompliance(bits) {
     signal input evidenceHash;
 
     // ---- output ----
+    signal output regionOk;
+    signal output protectedAreaOk;
+    signal output landCoverOk;
+    signal output quantityOk;
+    signal output supplierOk;
+    signal output evidenceOk;
     signal output valid;
 
     // 1. protectedFlag must be boolean
@@ -96,8 +106,6 @@ template EnvironmentalCompliance(bits) {
     qOk.in[1] <== quantityThreshold;
 
     // 5. protectedFlag must be exactly 0 (not in a detected protected area)
-    signal notProtected;
-    notProtected <== 1 - protectedFlag;
 
     // 6. landCoverCode must equal the publicly allowed code
     component landOk = IsEqual();
@@ -108,9 +116,9 @@ template EnvironmentalCompliance(bits) {
     component commitHasher = Poseidon(2);
     commitHasher.inputs[0] <== supplierId;
     commitHasher.inputs[1] <== supplierSecret;
-    component commitOk = IsEqual();
-    commitOk.in[0] <== commitHasher.out;
-    commitOk.in[1] <== supplierCommitment;
+    component commitEq = IsEqual();
+    commitEq.in[0] <== commitHasher.out;
+    commitEq.in[1] <== supplierCommitment;
 
     // 8. evidence binding: Poseidon(latEnc, lonEnc, protectedFlag, landCoverCode) == evidenceHash
     component evidenceHasher = Poseidon(4);
@@ -118,35 +126,40 @@ template EnvironmentalCompliance(bits) {
     evidenceHasher.inputs[1] <== lonEnc;
     evidenceHasher.inputs[2] <== protectedFlag;
     evidenceHasher.inputs[3] <== landCoverCode;
-    component evidenceOk = IsEqual();
-    evidenceOk.in[0] <== evidenceHasher.out;
-    evidenceOk.in[1] <== evidenceHash;
+    component evidenceEq = IsEqual();
+    evidenceEq.in[0] <== evidenceHasher.out;
+    evidenceEq.in[1] <== evidenceHash;
 
-    // ---- combine all conditions ----
+    // ---- compute sub-check results ----
+    // Region: 4-way AND via bilinear intermediate signals
     signal a1;
     signal a2;
     signal a3;
     signal a4;
     signal a5;
-    signal a6;
-    signal a7;
+    signal r1;
+    signal r2;
 
-    a1 <== geLat.out * leLat.out;
-    a2 <== a1 * geLon.out;
-    a3 <== a2 * leLon.out;
-    a4 <== a3 * qOk.out;
-    a5 <== a4 * notProtected;
-    a6 <== a5 * landOk.out;
-    a7 <== a6 * commitOk.out;
-    valid <== a7 * evidenceOk.out;
+    r1 <== geLat.out * leLat.out;
+    r2 <== r1 * geLon.out;
+    regionOk <== r2 * leLon.out;
+    
+    protectedAreaOk <== 1 - protectedFlag;
+    landCoverOk <== landOk.out;
+    quantityOk <== qOk.out;
+    supplierOk <== commitEq.out;
+    evidenceOk <== evidenceEq.out;
 
-    // The circuit does not merely output "valid" as an informational signal -
-    // it is CONSTRAINED to 1, so a witness that fails any condition cannot
-    // produce a proof for a "valid == 1" public output at all: the proving
-    // key generation below fixes valid=1 as the only satisfiable public
-    // output for this circuit's intended use (see scripts/prove.sh which
-    // fails proof generation, not just prints a warning, on invalid input).
-    valid === 1;
+    a1 <== regionOk * protectedAreaOk;
+    a2 <== a1 * landCoverOk;
+    a3 <== a2 * quantityOk;
+    a4 <== a3 * supplierOk;
+    valid <== a4 * evidenceOk;
+
+    // The circuit outputs "valid" and sub-check flags as informational signals.
+    // It DOES NOT constrain valid to 1, meaning that even non-compliant inputs
+    // will produce a valid proof (but with valid=0 and specific sub-flags=0),
+    // allowing the verifier to explicitly inspect the evaluation result.
 }
 
 // bits=32 is enough for: latEnc in [0, 180_000_000], lonEnc in [0, 360_000_000],

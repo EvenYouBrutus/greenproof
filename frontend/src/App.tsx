@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { MapContainer, TileLayer, Marker, Popup, useMap, useMapEvents } from "react-leaflet";
-import { generateProof, verifyProofLocally, type RegionConfig } from "./lib/zk";
+import { generateProof, verifyProofLocally, parseComplianceChecks, type RegionConfig, type ComplianceChecks } from "./lib/zk";
 import "./app.css";
 
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || "http://localhost:8080";
@@ -349,7 +349,7 @@ function SupplierView({ onVerificationCreated }: { onVerificationCreated: (id: s
       });
       setProofResult(result);
     } catch (e: any) {
-      setProveError("The circuit rejected this witness. " + (e?.message || String(e)));
+      setProveError("Proof generation failed. " + (e?.message || String(e)));
     } finally {
       setProving(false);
     }
@@ -654,7 +654,8 @@ function SupplierView({ onVerificationCreated }: { onVerificationCreated: (id: s
               <strong>Policy not satisfied</strong>
               <span>
                 Evidence was retrieved, but one or more environmental constraints did not pass.
-                Proof generation may still be attempted; the circuit will reject invalid witnesses.
+                A proof can still be generated — the circuit will output the evaluation result
+                rather than rejecting the witness.
               </span>
             </div>
           )}
@@ -707,7 +708,7 @@ function SupplierView({ onVerificationCreated }: { onVerificationCreated: (id: s
       )}
 
       {proofResult && (
-        <section className="card stage-card stage-completed proof-card">
+        <section className={`card stage-card stage-completed proof-card`}>
           <div className="card-header">
             <div>
               <p className="card-kicker">03 · Zero-knowledge proof</p>
@@ -718,10 +719,21 @@ function SupplierView({ onVerificationCreated }: { onVerificationCreated: (id: s
                 Proof generated
               </h3>
             </div>
-            <StatusBadge tone="success">Valid witness</StatusBadge>
+            <StatusBadge tone={proofResult.compliant ? "success" : "warn"}>
+              {proofResult.compliant ? "Compliant" : "Not compliant"}
+            </StatusBadge>
           </div>
 
           <div className="proof-summary">
+            <MetaRow
+              label="Compliance status"
+              value={proofResult.compliant ? "COMPLIANT" : "NOT COMPLIANT"}
+              badge={
+                <StatusBadge tone={proofResult.compliant ? "success" : "warn"}>
+                  {proofResult.compliant ? "Pass" : "Fail"}
+                </StatusBadge>
+              }
+            />
             <MetaRow
               label="Private inputs"
               value="Hidden"
@@ -734,13 +746,33 @@ function SupplierView({ onVerificationCreated }: { onVerificationCreated: (id: s
             />
             <MetaRow
               label="Local circuit"
-              value="Constraints satisfied"
+              value="Evaluation computed"
               badge={<StatusBadge tone="success">Pass</StatusBadge>}
             />
           </div>
 
           <div className="check-grid">
             <Check label="Groth16 proof generated" pass />
+            <Check label="Region check" pass={proofResult.checks.regionOk} />
+            <Check label="Protected area check" pass={proofResult.checks.protectedAreaOk} />
+            <Check label="Land cover check" pass={proofResult.checks.landCoverOk} />
+            <Check label="Quantity threshold check" pass={proofResult.checks.quantityOk} />
+            <Check label="Supplier commitment" pass={proofResult.checks.supplierOk} />
+            <Check label="Evidence binding" pass={proofResult.checks.evidenceOk} />
+          </div>
+
+          {!proofResult.compliant && (
+            <div className="inline-warn" role="status">
+              <strong>Not compliant</strong>
+              <span>
+                The proof was generated successfully but the location does not meet all policy
+                requirements. Failed checks are shown above. The verifier will see the compliance
+                status without learning the private inputs.
+              </span>
+            </div>
+          )}
+
+          <div className="check-grid">
             <Check label="Private quantity disclosed" pass={false} />
             <Check label="Supplier secret disclosed" pass={false} />
             <Check label="Exact coordinates shared with auditor" pass={false} />
@@ -1002,17 +1034,42 @@ function AuditorView({ initialId }: { initialId: string | null }) {
 
         {result && (
           <div className={`verification-result${valid ? " reveal-success" : " reveal-fail"}`}>
-            {valid ? (
+          {(() => {
+            const compliant = result?.compliance_status === "COMPLIANT";
+            const failedChecks: string[] = result?.failed_checks || [];
+            // For locally verified proofs (pasted), parse from public signals
+            const localChecks = result?.public_signals && !result?.compliance_status
+              ? parseComplianceChecks(result.public_signals as string[])
+              : null;
+            const isCompliant = localChecks ? localChecks.valid : compliant;
+
+            return valid ? (
               <div className="payoff">
                 <div className="payoff-badge" aria-hidden="true">
-                  ✓
+                  {isCompliant ? "✓" : "!"}
                 </div>
                 <div>
-                  <p className="eyebrow success-eyebrow">Environmental policy verified</p>
-                  <h3>✓ Environmental policy verified</h3>
-                  <p className="payoff-message">
-                    The supplier proved compliance without revealing the sensitive location.
+                  <p className="eyebrow success-eyebrow">
+                    {isCompliant ? "Environmental policy verified" : "Evaluation verified — not compliant"}
                   </p>
+                  <h3>
+                    {isCompliant
+                      ? "✓ Environmental policy verified"
+                      : "✓ Proof valid — NOT COMPLIANT"}
+                  </h3>
+                  <p className="payoff-message">
+                    {isCompliant
+                      ? "The supplier proved compliance without revealing the sensitive location."
+                      : "The proof is cryptographically valid but the location does not meet all policy requirements."}
+                  </p>
+                  {!isCompliant && failedChecks.length > 0 && (
+                    <div className="inline-warn" role="status">
+                      <strong>Failed checks:</strong>
+                      <ul style={{ margin: "0.5rem 0 0", paddingLeft: "1.25rem" }}>
+                        {failedChecks.map((c: string) => <li key={c}>{c}</li>)}
+                      </ul>
+                    </div>
+                  )}
                 </div>
               </div>
             ) : (
@@ -1028,7 +1085,8 @@ function AuditorView({ initialId }: { initialId: string | null }) {
                   </p>
                 </div>
               </div>
-            )}
+            );
+          })()}
 
             <div className="result-matrix">
               <div className="matrix-item">
@@ -1066,7 +1124,9 @@ function AuditorView({ initialId }: { initialId: string | null }) {
               </div>
               <div className="certificate-row">
                 <span>Result</span>
-                <strong className={valid ? "pass" : "fail"}>{valid ? "Pass" : "Fail"}</strong>
+                <strong className={result?.compliance_status === "COMPLIANT" ? "pass" : "fail"}>
+                  {result?.compliance_status === "COMPLIANT" ? "Compliant" : "Not Compliant"}
+                </strong>
               </div>
               <div className="certificate-row">
                 <span>ZK verification</span>

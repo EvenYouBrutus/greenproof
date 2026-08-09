@@ -114,12 +114,8 @@ async function main() {
   fs.writeFileSync(path.join(outDir, "input.json"), JSON.stringify(input, null, 2));
 
   if (failures.length > 0) {
-    console.error("PRE-FLIGHT CHECK FAILED (this witness cannot satisfy the circuit):");
-    for (const f of failures) console.error("  - " + f);
-    console.error(
-      "Attempting real proof generation anyway to demonstrate the circuit " +
-      "genuinely rejects invalid witnesses (this is expected to fail below)."
-    );
+    console.warn("PRE-FLIGHT: the following policy checks will FAIL in the circuit (proof will still be generated):");
+    for (const f of failures) console.warn("  - " + f);
   }
 
   const buildDir = path.join(__dirname, "..", "circuits", "build");
@@ -139,17 +135,24 @@ async function main() {
     fs.writeFileSync(path.join(outDir, "proof.json"), JSON.stringify(proof, null, 2));
     fs.writeFileSync(path.join(outDir, "public.json"), JSON.stringify(publicSignals, null, 2));
 
-    // Never write private inputs anywhere near the outputs shipped to a verifier.
+    // Parse circuit output signals for compliance status
+    const valid = publicSignals[0] === "1";
+    const checkNames = ["valid", "regionOk", "protectedAreaOk", "landCoverOk", "quantityOk", "supplierOk", "evidenceOk"];
     console.log("PROOF GENERATED:", path.join(outDir, "proof.json"));
     console.log("PUBLIC SIGNALS:", path.join(outDir, "public.json"));
+    console.log("COMPLIANCE STATUS:", valid ? "COMPLIANT" : "NOT COMPLIANT");
+    console.log("Circuit output signals:");
+    for (let i = 0; i < 7; i++) {
+      console.log(`  ${checkNames[i]}: ${publicSignals[i] === "1" ? "PASS" : "FAIL"}`);
+    }
     console.log(
-      "Public signals disclosed to the auditor include: latMin/latMax/lonMin/lonMax, " +
-      "quantityThreshold, allowedLandCoverCode, supplierCommitment, evidenceHash, and the " +
-      "circuit's 'valid' output. Exact latitude/longitude/quantity/supplierId/supplierSecret " +
+      "Public signals disclosed to the auditor include: compliance check results, latMin/latMax/lonMin/lonMax, " +
+      "quantityThreshold, allowedLandCoverCode, supplierCommitment, evidenceHash. " +
+      "Exact latitude/longitude/quantity/supplierId/supplierSecret " +
       "are never included."
     );
   } catch (err) {
-    console.error("PROOF GENERATION FAILED - the witness does not satisfy the circuit's constraints.");
+    console.error("PROOF GENERATION FAILED - unexpected error (evidence hash mismatch?).");
     console.error(String(err.message || err));
     process.exit(3);
   }
