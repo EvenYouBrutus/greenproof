@@ -16,8 +16,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenvy = "0.15"
 rand = "0.8"
 sha2 = "0.10"
-tiff = "0.9"
-zip = "2"
+geotiff-reader = "0.7"
 
 [dev-dependencies]
 tower = { version = "0.4", features = ["util"] }
