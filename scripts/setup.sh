@@ -16,9 +16,12 @@ mkdir -p "$BUILD_DIR"
 echo "==> Installing script dependencies (snarkjs, circomlib)"
 npm install --no-audit --no-fund
 
-echo "==> Vendoring circomlib into circuits/ so 'include \"circomlib/...\"' resolves"
+echo "==> Vendoring circomlib into circuits/ so 'include \"circomlib/circuits/...\"' resolves"
+# The circuit imports paths such as circomlib/circuits/poseidon.circom.
+# Therefore the vendored package must preserve its top-level `circuits/` directory.
+rm -rf "$CIRCUITS_DIR/circomlib"
 mkdir -p "$CIRCUITS_DIR/circomlib"
-cp -r node_modules/circomlib/circuits/* "$CIRCUITS_DIR/circomlib/"
+cp -r node_modules/circomlib/. "$CIRCUITS_DIR/circomlib/"
 
 echo "==> Compiling environmental_compliance.circom"
 circom "$CIRCUITS_DIR/environmental_compliance.circom" \
