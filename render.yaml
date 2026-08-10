@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: greenproof-backend
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    envVars:
+      - key: GREENPROOF_BACKEND_ADDR
+        value: 0.0.0.0:8080
+      - key: GREENPROOF_SCRIPTS_DIR
+        value: /app/scripts
+      - key: GREENPROOF_VKEY_PATH
+        value: /app/circuits/build/verification_key.json
